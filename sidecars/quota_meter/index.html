@@ -23,12 +23,17 @@
   header { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; gap:8px; }
   header h1 { font-size:14px; margin:0; font-weight:600; }
   button, select, input { font:inherit; color:var(--fg); background:transparent; border:1px solid var(--line); border-radius:8px; padding:3px 9px; }
+  select option { background:var(--bg); color:var(--fg); }
   button { cursor:pointer; color:var(--mut); }
   button:hover { color:var(--fg); }
   button.primary { color:var(--fg); border-color:color-mix(in srgb, var(--ok) 60%, transparent); }
   .card { background:var(--card-bg); border:1px solid var(--line); border-radius:12px; padding:10px 12px; margin-bottom:10px; }
   .gname { font-weight:600; display:flex; justify-content:space-between; align-items:center; gap:8px; }
   .chip { font-size:11.5px; font-weight:600; padding:1px 7px; border-radius:10px; }
+  .badge { font-size:11px; font-weight:600; padding:1px 7px; border-radius:10px; white-space:nowrap; }
+  .badge.run { color:var(--ok); background:color-mix(in srgb, var(--ok) 15%, transparent); }
+  .badge.act { color:var(--warn); background:color-mix(in srgb, var(--warn) 15%, transparent); }
+  .badge.idle { color:var(--mut); background:color-mix(in srgb, var(--fg) 8%, transparent); }
   details.models { margin:2px 0 4px; }
   details.models summary { cursor:pointer; color:var(--mut); font-size:11.5px; list-style:none; }
   details.models summary::before { content:'▸ '; }
@@ -48,11 +53,13 @@
   .advice.warn { border-color:color-mix(in srgb,var(--warn) 50%,transparent); background:color-mix(in srgb,var(--warn) 10%,transparent); }
   .advice.crit { border-color:color-mix(in srgb,var(--crit) 50%,transparent); background:color-mix(in srgb,var(--crit) 10%,transparent); }
   h2 { font-size:13px; margin:0 0 6px; font-weight:600; display:flex; justify-content:space-between; align-items:center; }
-  .meter-form { display:flex; gap:6px; } .meter-form input { flex:1; min-width:0; }
-  .kv { display:flex; justify-content:space-between; gap:8px; font-size:12px; padding:2px 0; }
+  .meter-form { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
+  .meter-form select { flex:1; min-width:160px; }
+  .kv { display:flex; justify-content:space-between; align-items:center; gap:8px; font-size:12px; padding:2px 0; }
   .kv span:last-child { font-variant-numeric:tabular-nums; }
-  .run { border-top:1px solid var(--line); padding:6px 0; }
-  .run:first-child { border-top:none; }
+  .conv-item, .run { border-top:1px solid var(--line); padding:7px 0; }
+  .conv-item:first-of-type, .run:first-of-type { border-top:none; }
+  .conv-title { font-weight:600; font-size:12.8px; display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
   .btns { display:flex; gap:6px; margin-top:6px; }
   .ev { font-size:12px; padding:3px 0; border-top:1px solid var(--line); }
   .ev:first-child { border-top:none; }
@@ -60,7 +67,7 @@
   .set input[type=number] { width:64px; }
   .foot { color:var(--mut); font-size:11.5px; text-align:center; margin-top:4px; }
   .err { color:var(--crit); white-space:pre-wrap; }
-  details.sec > summary { cursor:pointer; font-weight:600; font-size:13px; }
+  details.sec > summary { cursor:pointer; font-weight:600; font-size:12.5px; color:var(--mut); }
   body.compact .wrap { padding:8px; }
   body.compact .card { padding:8px 10px; margin-bottom:8px; }
   body.compact .full-only { display:none; }
@@ -90,8 +97,8 @@ const gz = name => GROUP_ZH[name] || name;
 const api = (path, body) => (window.sidecar?.fetch || fetch)(path, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body || {}) }).then(r => r.json());
 
 function dur(ms) {
-  if (!(ms > 0)) return '0分钟';
-  const m = Math.round(ms / MIN), d = Math.floor(m / 1440), h = Math.floor(m % 1440 / 60);
+  if (!(ms > 0)) return '1分钟内';
+  const m = Math.max(1, Math.round(ms / MIN)), d = Math.floor(m / 1440), h = Math.floor(m % 1440 / 60);
   return d ? `${d}天${h}小时` : h ? `${h}小时${m % 60}分` : `${m % 60}分钟`;
 }
 const resetMs = b => Date.parse(b.reset) - Date.now();
@@ -102,6 +109,7 @@ const models = g => {
 };
 
 let S = null;
+let meterOpen = { moreConv: false, manual: false };
 
 // ---------- 功能 4：切换建议 ----------
 function renderAdvice() {
@@ -167,7 +175,7 @@ function renderPools() {
   }).join('') || '<div class="sub">没有额度数据</div>';
 }
 
-// ---------- 功能 3：任务油耗 ----------
+// ---------- 功能 3：按「对话列表」自动统计并行任务油耗 + 手动分段掐表 ----------
 function usedRows(used, resets) {
   const groups = {};
   for (const [id, u] of Object.entries(used || {})) {
@@ -175,38 +183,122 @@ function usedRows(used, resets) {
     (groups[m.group] ||= []).push({ win: m.window, u, reset: resets?.[id] });
   }
   const rows = Object.entries(groups).filter(([, a]) => a.some(x => x.u > 0.00005));
-  if (!rows.length) return '<div class="sub">暂未检测到额度变化</div>';
+  if (!rows.length) return '<div class="sub">暂未产生明显额度消耗</div>';
   return rows.map(([g, a]) => `<div class="kv"><span>${esc(gz(g))}</span><span>${
     a.sort((x, y) => (x.win === '5h' ? 0 : 1) - (y.win === '5h' ? 0 : 1))
      .map(x => `${WIN_ZH[x.win] || x.win} ${dpct(x.u)}${x.reset ? '*' : ''}`).join(' · ')}</span></div>`).join('')
-    + (Object.values(resets || {}).some(Boolean) ? '<div class="sub">* 期间发生过重置，数值可能略低</div>' : '');
+    + (Object.values(resets || {}).some(Boolean) ? '<div class="sub">* 期间发生过重置，已自动跨重置累计</div>' : '');
+}
+
+function renderConvCard(c) {
+  const badge = c.status === 'running'
+    ? '<span class="badge run">● 进行中</span>'
+    : c.active
+    ? `<span class="badge act">⚡ ${dur(S.now - c.updatedAt)}前活跃</span>`
+    : `<span class="badge idle">${c.updatedAt ? new Date(c.updatedAt).toLocaleString('zh-CN', { month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit' }) : '已休眠'}</span>`;
+  const mtags = (c.models || []).map(m => `<span class="tag">${esc(m)}</span>`).join('');
+  return `<div class="conv-item">
+    <div class="kv">
+      <span class="conv-title">${esc(c.title)} ${badge}</span>
+      <span class="sub">${c.modelSteps || 0} 轮调用</span>
+    </div>
+    ${mtags ? `<div style="margin:2px 0 4px">${mtags}</div>` : ''}
+    ${usedRows(c.used, c.resets)}
+  </div>`;
 }
 
 function renderMeter() {
   const el = document.getElementById('meter');
-  const m = S.mark;
-  const prevIn = document.getElementById('mlabel');
-  const keep = prevIn ? { v: prevIn.value, f: document.activeElement === prevIn } : null;
-  let h = '<div class="card"><h2>任务油耗计量</h2>';
-  if (!m) {
-    h += `<div class="meter-form"><input id="mlabel" placeholder="任务名，如：用 Neon 重构登录（可选）" maxlength="60"/><button class="primary" id="mstart">开始计量</button></div>
-          <div class="sub" style="margin-top:4px">开始一个任务前点一下，结束后点"结束"，即可看到这次任务消耗了多少额度。</div>`;
+  const convs = S.conversations || [];
+  const marks = S.marks || (S.mark ? [S.mark] : []);
+  const prevSel = document.getElementById('mconv')?.value;
+
+  // 正在运行或近期活跃的对话全部并列显示；若暂时都没有近期活跃，则默认展示最近的前 3 个对话
+  const activeConvs = convs.filter(c => c.active);
+  const topConvs = activeConvs.length ? activeConvs : convs.slice(0, 3);
+  const topIds = new Set(topConvs.map(c => c.id));
+  const restConvs = convs.filter(c => !topIds.has(c.id));
+
+  let h = `<div class="card">
+    <h2><span>任务油耗统计（按对话列表自动命名）</span><span class="sub" style="font-weight:400">${activeConvs.length ? `${activeConvs.length} 个对话并行/活跃` : `共 ${convs.length} 个对话`}</span></h2>`;
+
+  if (topConvs.length) {
+    h += topConvs.map(renderConvCard).join('');
   } else {
-    h += `<div class="kv"><span>⏱ ${esc(m.label || '未命名任务')}</span><span>已进行 ${dur(S.now - m.t)}</span></div>
-          ${usedRows(m.used, m.resets)}
-          <div class="btns"><button class="primary" id="mstop">结束并保存</button><button id="mcancel">放弃</button></div>`;
+    h += '<div class="sub">暂无对话记录</div>';
   }
-  if (S.runs.length && !compact) {
-    h += `<h2 style="margin-top:10px">历史记录 <button id="mclear" style="font-size:11px;padding:1px 7px">清空</button></h2>`;
-    h += S.runs.slice(0, 10).map(r => `<div class="run"><div class="kv"><b>${esc(r.label || '未命名任务')}</b><span class="sub">${new Date(r.start).toLocaleString('zh-CN', { month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit' })} · ${dur(r.end - r.start)}</span></div>${usedRows(r.used, r.resets)}</div>`).join('');
+
+  if (restConvs.length && !compact) {
+    h += `<details class="sec" id="dmoreconv" style="margin-top:6px" ${meterOpen.moreConv ? 'open' : ''}>
+      <summary>其他历史对话（${restConvs.length}）</summary>
+      <div style="margin-top:4px">${restConvs.map(renderConvCard).join('')}</div>
+    </details>`;
   }
-  el.innerHTML = h + '</div>';
+
+  // 手动分段掐表（支持同时开启多个任务，下拉直接选对话列表名称）
+  const openManual = meterOpen.manual || marks.length > 0;
+  h += `<details class="sec" id="dmanual" style="margin-top:8px;padding-top:6px;border-top:1px solid var(--line)" ${openManual ? 'open' : ''}>
+    <summary>手动分段掐表${marks.length ? `（${marks.length} 个进行中）` : ''}</summary>
+    <div style="margin-top:6px">
+      <div class="meter-form">
+        <select id="mconv">
+          <option value="">全部活跃对话合计（自动命名）</option>
+          ${convs.map(c => `<option value="${esc(c.id)}">${esc(c.title)}${c.status === 'running' ? ' (进行中)' : ''}</option>`).join('')}
+        </select>
+        <button class="primary" id="mstart">+ 新增掐表</button>
+      </div>
+      <div class="sub" style="margin-top:4px">可同时开启多个掐表任务，默认按所选「对话列表」的名称命名。</div>`;
+
+  if (marks.length) {
+    h += `<div style="margin-top:6px">` + marks.map(m => `<div class="run">
+      <div class="kv"><b>⏱ ${esc(m.label)}</b><span class="sub">已进行 ${dur(S.now - m.t)}</span></div>
+      ${usedRows(m.used, m.resets)}
+      <div class="btns">
+        <button class="primary" data-stop="${esc(m.id)}">结束并保存</button>
+        <button data-cancel="${esc(m.id)}">放弃</button>
+      </div>
+    </div>`).join('') + `</div>`;
+  }
+
+  if (S.runs?.length && !compact) {
+    h += `<h2 style="margin-top:10px">手动掐表历史 <button id="mclear" style="font-size:11px;padding:1px 7px">清空</button></h2>`;
+    h += S.runs.slice(0, 10).map(r => `<div class="run">
+      <div class="kv"><b>${esc(r.label)}</b><span class="sub">${new Date(r.start).toLocaleString('zh-CN', { month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit' })} · ${dur(r.end - r.start)}</span></div>
+      ${usedRows(r.used, r.resets)}
+    </div>`).join('');
+  }
+  h += `</div></details></div>`;
+  el.innerHTML = h;
+
   const $ = id => document.getElementById(id);
-  if (keep && $('mlabel')) { $('mlabel').value = keep.v; if (keep.f) $('mlabel').focus(); }
-  $('mstart') && ($('mstart').onclick = async () => { $('mstart').disabled = true; S = await api('api/mark', { action:'start', label:$('mlabel').value }); if (S.error && !S.groups) alert(S.error); load(); });
-  $('mstop') && ($('mstop').onclick = async () => { $('mstop').disabled = true; S = await api('api/mark', { action:'stop' }); render(); });
-  $('mcancel') && ($('mcancel').onclick = async () => { if (confirm('放弃本次计量？')) { S = await api('api/mark', { action:'cancel' }); render(); } });
-  $('mclear') && ($('mclear').onclick = async () => { if (confirm('清空全部历史记录？')) { S = await api('api/mark', { action:'clearRuns' }); render(); } });
+  if (prevSel && $('mconv')) $('mconv').value = prevSel;
+  $('dmoreconv') && ($('dmoreconv').ontoggle = e => meterOpen.moreConv = e.target.open);
+  $('dmanual') && ($('dmanual').ontoggle = e => meterOpen.manual = e.target.open);
+  $('mstart') && ($('mstart').onclick = async () => {
+    $('mstart').disabled = true;
+    const convId = $('mconv').value;
+    const conv = convs.find(c => c.id === convId);
+    S = await api('api/mark', { action:'start', convId, label: conv ? conv.title : '' });
+    if (S.error && !S.groups) alert(S.error);
+    load();
+  });
+  el.querySelectorAll('[data-stop]').forEach(btn => btn.onclick = async () => {
+    btn.disabled = true;
+    S = await api('api/mark', { action:'stop', id: btn.dataset.stop });
+    render();
+  });
+  el.querySelectorAll('[data-cancel]').forEach(btn => btn.onclick = async () => {
+    if (confirm('放弃该条掐表记录？')) {
+      S = await api('api/mark', { action:'cancel', id: btn.dataset.cancel });
+      render();
+    }
+  });
+  $('mclear') && ($('mclear').onclick = async () => {
+    if (confirm('清空全部手动掐表历史？')) {
+      S = await api('api/mark', { action:'clearRuns' });
+      render();
+    }
+  });
 }
 
 // ---------- 功能 2：提醒记录 + 设置 ----------
@@ -256,7 +348,6 @@ async function load() {
 }
 document.getElementById('refresh').onclick = async e => { e.target.disabled = true; S = await api('api/refresh'); render(); e.target.disabled = false; };
 load();
-// 面板可见时才拉取（只读后台缓存，不会触发额外的额度查询）
 setInterval(() => document.visibilityState === 'visible' && load(), 60e3);
 document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && load());
 </script>
