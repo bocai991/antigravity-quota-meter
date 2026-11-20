@@ -222,19 +222,20 @@ const factorOfModel = (m) => (/flash|hydrogen/i.test(m) ? 0.25 : /opus|carbon/i.
 const shortModel = (m) =>
   String(m || '')
     .replace(/-(high|medium|low)$/i, '')
-    .replace(/^gemini-/i, 'Gemini ')
-    .replace(/^claude-/i, 'Claude ')
-    .replace(/-/g, ' ');
+    .replace(/(\d)-(\d)/g, '$1.$2')
+    .split('-')
+    .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : ''))
+    .join(' ');
 
-const transcriptCache = new Map(); // convId -> { key, steps, models }
+const transcriptCache = new Map(); // convId -> { key, steps, models, tokens }
 function readTranscriptSteps(brainDir, id) {
-  if (!brainDir) return { steps: [], models: [] };
+  if (!brainDir) return { steps: [], models: [], tokens: { input: 0, cache: 0, output: 0, total: 0 } };
   const p = join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl');
   let st;
   try {
     st = statSync(p);
   } catch {
-    return { steps: [], models: [] };
+    return { steps: [], models: [], tokens: { input: 0, cache: 0, output: 0, total: 0 } };
   }
   const key = `${st.mtimeMs}:${st.size}`;
   const hit = transcriptCache.get(id);
@@ -242,18 +243,26 @@ function readTranscriptSteps(brainDir, id) {
 
   const steps = [];
   const modelSet = new Set();
+  const tokens = { input: 0, cache: 0, output: 0, total: 0 };
   try {
     for (const line of readFileSync(p, 'utf-8').split('\n')) {
       if (!line.includes('"PLANNER_RESPONSE"')) continue;
       const obj = JSON.parse(line);
       if (obj.type !== 'PLANNER_RESPONSE' || !obj.model) continue;
       const t = Date.parse(obj.created_at) || 0;
-      const w = Math.max(200, ((obj.input_tokens || 0) + (obj.cache_read_tokens || 0) * 0.1 + (obj.output_tokens || 0) * 4) * factorOfModel(obj.model));
+      const inp = Number(obj.input_tokens || 0);
+      const cache = Number(obj.cache_read_tokens || 0);
+      const out = Number(obj.output_tokens || 0);
+      tokens.input += inp;
+      tokens.cache += cache;
+      tokens.output += out;
+      tokens.total += inp + cache + out;
+      const w = Math.max(200, (inp + cache * 0.1 + out * 4) * factorOfModel(obj.model));
       steps.push({ t, model: obj.model, pool: poolOfModel(obj.model), w });
       modelSet.add(shortModel(obj.model));
     }
   } catch {}
-  const val = { key, steps, models: [...modelSet] };
+  const val = { key, steps, models: [...modelSet], tokens };
   transcriptCache.set(id, val);
   return val;
 }
@@ -308,7 +317,7 @@ function buildConversationStats() {
     const status = info.status === 'CASCADE_RUN_STATUS_RUNNING' ? 'running' : 'idle';
     const createdAt = Date.parse(info.createdTime) || 0;
     const updatedAt = Date.parse(info.lastModifiedTime || info.lastUserInputTime || info.createdTime) || 0;
-    convMap.set(id, { id, title, status, createdAt, updatedAt, stepCount: info.stepCount || 0, steps: [], models: new Set(), used: {}, resets: {} });
+    convMap.set(id, { id, title, status, createdAt, updatedAt, stepCount: info.stepCount || 0, steps: [], models: new Set(), tokens: { input: 0, cache: 0, output: 0, total: 0 }, used: {}, resets: {} });
   }
 
   // 2. 合并本地 brain 目录下的 transcript.jsonl 步骤（子代理归入根对话）
@@ -326,14 +335,19 @@ function buildConversationStats() {
         stepCount: 0,
         steps: [],
         models: new Set(),
+        tokens: { input: 0, cache: 0, output: 0, total: 0 },
         used: {},
         resets: {},
       });
     }
     const target = convMap.get(rootId);
-    const { steps, models } = readTranscriptSteps(brainDir, id);
+    const { steps, models, tokens } = readTranscriptSteps(brainDir, id);
     target.steps.push(...steps);
     for (const m of models) target.models.add(m);
+    target.tokens.input += tokens.input;
+    target.tokens.cache += tokens.cache;
+    target.tokens.output += tokens.output;
+    target.tokens.total += tokens.total;
     if (steps.length) {
       const firstT = steps[0].t, lastT = steps.at(-1).t;
       if (!target.createdAt || (firstT && firstT < target.createdAt)) target.createdAt = firstT;
@@ -384,6 +398,7 @@ function buildConversationStats() {
       updatedAt: c.updatedAt,
       modelSteps: c.steps.length,
       models: [...c.models],
+      tokens: c.tokens,
       used: c.used,
       resets: c.resets,
     }))

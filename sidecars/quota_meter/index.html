@@ -59,7 +59,16 @@
   .kv span:last-child { font-variant-numeric:tabular-nums; }
   .conv-item, .run { border-top:1px solid var(--line); padding:7px 0; }
   .conv-item:first-of-type, .run:first-of-type { border-top:none; }
-  .conv-title { font-weight:600; font-size:12.8px; display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .conv-title { font-weight:600; font-size:13px; display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  details.conv-fold { margin-top:3px; font-size:11px; }
+  details.conv-fold > summary { cursor:pointer; list-style:none; display:flex; align-items:center; flex-wrap:wrap; gap:4px; color:var(--mut); user-select:none; }
+  details.conv-fold > summary::-webkit-details-marker { display:none; }
+  details.conv-fold > summary::before { content:'▸'; font-size:11px; color:var(--mut); margin-right:2px; line-height:1; }
+  details.conv-fold[open] > summary::before { content:'▾'; }
+  details.conv-fold .tag { font-size:10.5px; padding:1px 6px; margin:0; }
+  .conv-body { margin-top:4px; padding-left:13px; font-size:11px; color:var(--mut); }
+  .conv-body .kv { font-size:11px; padding:1.5px 0; }
+  .conv-body .sub { font-size:10.5px; }
   .btns { display:flex; gap:6px; margin-top:6px; }
   .ev { font-size:12px; padding:3px 0; border-top:1px solid var(--line); }
   .ev:first-child { border-top:none; }
@@ -110,6 +119,8 @@ const models = g => {
 
 let S = null;
 let meterOpen = { moreConv: false, manual: false };
+let convOpen = {};
+const fmtTok = n => !n ? '0' : n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(n);
 
 // ---------- 功能 4：切换建议 ----------
 function renderAdvice() {
@@ -196,14 +207,24 @@ function renderConvCard(c) {
     : c.active
     ? `<span class="badge act">⚡ ${dur(S.now - c.updatedAt)}前活跃</span>`
     : `<span class="badge idle">${c.updatedAt ? new Date(c.updatedAt).toLocaleString('zh-CN', { month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit' }) : '已休眠'}</span>`;
-  const mtags = (c.models || []).map(m => `<span class="tag">${esc(m)}</span>`).join('');
+  const models = c.models?.length ? c.models : ['暂无模型调用'];
+  const mtags = models.map(m => `<span class="tag">${esc(m)}</span>`).join('');
+  const tk = c.tokens || {};
+  const tokLine = tk.total
+    ? `<div class="kv"><span>Token 消耗</span><span>共 ${fmtTok(tk.total)}（输入 ${fmtTok(tk.input)} · 缓存 ${fmtTok(tk.cache)} · 输出 ${fmtTok(tk.output)}）</span></div>`
+    : '';
   return `<div class="conv-item">
     <div class="kv">
       <span class="conv-title">${esc(c.title)} ${badge}</span>
       <span class="sub">${c.modelSteps || 0} 轮调用</span>
     </div>
-    ${mtags ? `<div style="margin:2px 0 4px">${mtags}</div>` : ''}
-    ${usedRows(c.used, c.resets)}
+    <details class="conv-fold" data-cid="${esc(c.id)}" ${convOpen[c.id] ? 'open' : ''}>
+      <summary>${mtags}</summary>
+      <div class="conv-body">
+        ${usedRows(c.used, c.resets)}
+        ${tokLine}
+      </div>
+    </details>
   </div>`;
 }
 
@@ -272,6 +293,7 @@ function renderMeter() {
 
   const $ = id => document.getElementById(id);
   if (prevSel && $('mconv')) $('mconv').value = prevSel;
+  el.querySelectorAll('details.conv-fold').forEach(d => d.ontoggle = e => { convOpen[d.dataset.cid] = e.target.open; });
   $('dmoreconv') && ($('dmoreconv').ontoggle = e => meterOpen.moreConv = e.target.open);
   $('dmanual') && ($('dmanual').ontoggle = e => meterOpen.manual = e.target.open);
   $('mstart') && ($('mstart').onclick = async () => {
