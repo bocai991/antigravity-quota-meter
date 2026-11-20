@@ -311,16 +311,22 @@ function render() {
     '更新于 ' + new Date(S.fetchedAt).toLocaleTimeString('zh-CN') + ` · 后台每 ${S.settings.pollMin} 分钟刷新 · 不消耗 token`;
 }
 
-async function load() {
-  try { S = await (await fetch('api/state')).json(); }
-  catch (e) { S = { error: '无法连接额度服务：' + e.message, groups: [] }; }
+let lastRenderKey = '';
+async function load(forceRender = false) {
+  try {
+    const next = await (await fetch('api/state')).json();
+    const key = `${next.fetchedAt}|${next.error || ''}|${(next.conversations || []).map(c => `${c.id}:${c.title}:${c.status}:${c.modelSteps}`).join(',')}`;
+    S = next;
+    if (!forceRender && key === lastRenderKey) return;
+    lastRenderKey = key;
+  } catch (e) { S = { error: '无法连接额度服务：' + e.message, groups: [] }; }
   render();
 }
-document.getElementById('refresh').onclick = async e => { e.target.disabled = true; S = await api('api/refresh'); render(); e.target.disabled = false; };
-load();
-// 仅在面板打开可见时每 4 秒同步一次本地内存状态（0 Token 消耗，单次 <3ms）；面板收起或隐藏时不轮询
-setInterval(() => document.visibilityState === 'visible' && load(), 4e3);
-document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && load());
+document.getElementById('refresh').onclick = async e => { e.target.disabled = true; S = await api('api/refresh'); lastRenderKey = ''; render(); e.target.disabled = false; };
+load(true);
+// 面板隐藏时 0 轮询；切回面板瞬间刷新一次，停留在面板时每 30 秒轻量比对一次（数据未变则不重绘 DOM）
+setInterval(() => document.visibilityState === 'visible' && load(false), 30e3);
+document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && load(false));
 </script>
 </body>
 </html>

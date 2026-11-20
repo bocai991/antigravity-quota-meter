@@ -5,7 +5,7 @@
 //   * 标题零延迟兜底：持久化缓存对话标题 db.titles，并在语言服务器尚未懒加载工作区对话时直接从本地 transcript.jsonl 首条请求提取标题，彻底消除“对话 9d463d”占位名。
 //   * 事件驱动采样：检测到本地任意对话新增模型调用步数时（且距上次采样 >15 秒），自动立即刷新一次额度；空闲时维持低频轮询。
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -87,7 +87,7 @@ async function lsrpc(method, body = {}) {
 
 let trajCache = { at: 0, map: {} };
 async function fetchTrajectories(force = false) {
-  if (!force && Date.now() - trajCache.at < 3000 && Object.keys(trajCache.map).length) return trajCache.map;
+  if (!force && Date.now() - trajCache.at < 30000 && Object.keys(trajCache.map).length) return trajCache.map;
   try {
     const r = await lsrpc('GetAllCascadeTrajectories');
     const map = r.trajectorySummaries || {};
@@ -250,54 +250,70 @@ const shortModel = (m) =>
     .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : ''))
     .join(' ');
 
-const transcriptCache = new Map(); // convId -> { key, steps, models, tokens, firstPrompt }
+const transcriptCache = new Map(); // convId -> { offset, mtime, steps, modelSet, models, tokens, firstPrompt }
 let lastTotalSteps = 0;
 
+// 增量读取 transcript.jsonl：只读取上次 offset 之后新追加的字节，避免反复将整份大文件读入内存
 function readTranscriptSteps(brainDir, id) {
-  if (!brainDir) return { steps: [], models: [], tokens: { input: 0, cache: 0, output: 0, total: 0 }, firstPrompt: '' };
+  const empty = { steps: [], models: [], tokens: { input: 0, cache: 0, output: 0, total: 0 }, firstPrompt: '', mtime: 0 };
+  if (!brainDir) return empty;
   const p = join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl');
   let st;
   try {
     st = statSync(p);
   } catch {
-    return { steps: [], models: [], tokens: { input: 0, cache: 0, output: 0, total: 0 }, firstPrompt: '' };
+    transcriptCache.delete(id);
+    return empty;
   }
-  const key = `${st.mtimeMs}:${st.size}`;
-  const hit = transcriptCache.get(id);
-  if (hit && hit.key === key) return hit;
-
-  const steps = [];
-  const modelSet = new Set();
-  const tokens = { input: 0, cache: 0, output: 0, total: 0 };
-  let firstPrompt = '';
-  try {
-    for (const line of readFileSync(p, 'utf-8').split('\n')) {
-      if (!firstPrompt && line.includes('"USER_INPUT"')) {
-        try {
-          const u = JSON.parse(line);
-          const m = /<USER_REQUEST>\s*([^\r\n<]+)/.exec(u.content || '');
-          if (m) firstPrompt = m[1].trim().slice(0, 28);
-        } catch {}
+  let entry = transcriptCache.get(id);
+  if (entry && entry.size === st.size && entry.mtime === st.mtimeMs) return entry;
+  // 若文件被截断或首次读取，则从头初始化；若只是追加了新行，则仅从上次 offset 读取新增字节
+  if (!entry || st.size < entry.offset) {
+    entry = { offset: 0, size: 0, mtime: 0, steps: [], modelSet: new Set(), models: [], tokens: { input: 0, cache: 0, output: 0, total: 0 }, firstPrompt: '' };
+  }
+  const toRead = st.size - entry.offset;
+  if (toRead > 0) {
+    let fd;
+    try {
+      fd = openSync(p, 'r');
+      const buf = Buffer.allocUnsafe(toRead);
+      const bytes = readSync(fd, buf, 0, toRead, entry.offset);
+      const chunk = buf.toString('utf-8', 0, bytes);
+      const lastNL = chunk.lastIndexOf('\n');
+      const complete = lastNL >= 0 ? chunk.slice(0, lastNL + 1) : chunk;
+      entry.offset += Buffer.byteLength(complete, 'utf-8');
+      for (const line of complete.split('\n')) {
+        if (!entry.firstPrompt && line.includes('"USER_INPUT"')) {
+          try {
+            const u = JSON.parse(line);
+            const m = /<USER_REQUEST>\s*([^\r\n<]+)/.exec(u.content || '');
+            if (m) entry.firstPrompt = m[1].trim().slice(0, 28);
+          } catch {}
+        }
+        if (!line.includes('"PLANNER_RESPONSE"')) continue;
+        const obj = JSON.parse(line);
+        if (obj.type !== 'PLANNER_RESPONSE' || !obj.model) continue;
+        const t = Date.parse(obj.created_at) || 0;
+        const inp = Number(obj.input_tokens || 0);
+        const cache = Number(obj.cache_read_tokens || 0);
+        const out = Number(obj.output_tokens || 0);
+        entry.tokens.input += inp;
+        entry.tokens.cache += cache;
+        entry.tokens.output += out;
+        entry.tokens.total += inp + cache + out;
+        const w = Math.max(200, (inp + cache * 0.1 + out * 4) * factorOfModel(obj.model));
+        entry.steps.push({ t, pool: poolOfModel(obj.model), w });
+        entry.modelSet.add(shortModel(obj.model));
       }
-      if (!line.includes('"PLANNER_RESPONSE"')) continue;
-      const obj = JSON.parse(line);
-      if (obj.type !== 'PLANNER_RESPONSE' || !obj.model) continue;
-      const t = Date.parse(obj.created_at) || 0;
-      const inp = Number(obj.input_tokens || 0);
-      const cache = Number(obj.cache_read_tokens || 0);
-      const out = Number(obj.output_tokens || 0);
-      tokens.input += inp;
-      tokens.cache += cache;
-      tokens.output += out;
-      tokens.total += inp + cache + out;
-      const w = Math.max(200, (inp + cache * 0.1 + out * 4) * factorOfModel(obj.model));
-      steps.push({ t, model: obj.model, pool: poolOfModel(obj.model), w });
-      modelSet.add(shortModel(obj.model));
+      entry.models = [...entry.modelSet];
+    } catch {} finally {
+      if (fd !== undefined) try { closeSync(fd); } catch {}
     }
-  } catch {}
-  const val = { key, steps, models: [...modelSet], tokens, firstPrompt };
-  transcriptCache.set(id, val);
-  return val;
+  }
+  entry.size = st.size;
+  entry.mtime = st.mtimeMs;
+  transcriptCache.set(id, entry);
+  return entry;
 }
 
 function extractDrops(sinceT = 0) {
@@ -350,9 +366,31 @@ function resolveTitle(id, info, firstPrompt) {
   return `对话 ${id.slice(0, 6)}`;
 }
 
+let convStatsCache = { sig: '', list: [] };
+
 function buildConversationStats() {
   const brainDir = findBrainDir();
   const summaries = trajCache.map || {};
+  const diskDirs = brainDir ? readdirSync(brainDir).filter((d) => /^[0-9a-f-]{20,}$/i.test(d)) : [];
+  // 清理已删除对话的缓存，防止长期运行内存增长
+  const activeIdSet = new Set([...Object.keys(summaries), ...diskDirs]);
+  for (const cachedId of transcriptCache.keys()) {
+    if (!activeIdSet.has(cachedId)) transcriptCache.delete(cachedId);
+  }
+
+  // 先增量刷新各对话 transcript，并生成数据指纹；若指纹未变则直接复用上次归属计算结果
+  const sigParts = [`s:${db.samples.length}:${db.samples.at(-1)?.t || 0}`];
+  for (const id of activeIdSet) {
+    const tr = readTranscriptSteps(brainDir, id);
+    const info = summaries[id];
+    sigParts.push(`${id}:${tr.size || 0}:${info?.status || ''}:${info?.annotations?.title || info?.summary || ''}`);
+  }
+  const sig = sigParts.join('|');
+  if (sig === convStatsCache.sig && convStatsCache.list.length) {
+    const now = Date.now();
+    return convStatsCache.list.map((c) => ({ ...c, active: c.status === 'running' || now - c.updatedAt < 45 * MIN }));
+  }
+
   const convMap = new Map();
 
   for (const [id, info] of Object.entries(summaries)) {
@@ -454,7 +492,7 @@ function buildConversationStats() {
   }
 
   const now = Date.now();
-  return [...convMap.values()]
+  const list = [...convMap.values()]
     .map((c) => ({
       id: c.id,
       title: c.title,
@@ -469,6 +507,8 @@ function buildConversationStats() {
       resets: c.resets,
     }))
     .sort((a, b) => (b.status === 'running') - (a.status === 'running') || b.updatedAt - a.updatedAt);
+  convStatsCache = { sig, list };
+  return list;
 }
 
 // ---------- 对外状态 ----------
