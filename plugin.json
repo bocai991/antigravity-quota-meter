@@ -4,7 +4,7 @@
   "description": "轻量的 Antigravity 额度面板：三个额度池的剩余比例与重置时间、消耗速度与耗尽预估、低额度/恢复通知、按对话列表自动统计并行任务油耗、模型切换建议。不消耗 token。",
   "version": "1.3.1",
   "author": {
-    "name": "Chloride",
+    "name": "bocai991",
     "url": "https://github.com/bocai991"
   },
   "repository": "https://github.com/bocai991/antigravity-quota-meter",
