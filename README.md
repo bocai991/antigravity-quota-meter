@@ -59,9 +59,8 @@ git clone https://github.com/bocai991/antigravity-quota-meter.git ~/.gemini/conf
 
 ## 使用方式
 
-- **从左侧「扩展」区域打开**：在左侧导航栏的 **「扩展」** 栏下点击 **“额度”**。
-- **从对话标题栏打开**：点击对话右上角的 **`+`** 菜单，选择 **“额度”** 打开右侧辅助面板。
-- **在对话中一键打开**：在 Antigravity 对话中点击链接 `sidecar://quota-meter/quota_meter/`。
+- **从左侧「扩展」栏打开**：在界面左侧栏的 **「扩展」** 分组下（位于「自定义配置」与「项目列表」之间），直接点击 **“🟢 额度”**。
+- **在对话中一键打开**：在 Antigravity 对话中点击胶囊链接 `[额度](sidecar://quota-meter/quota_meter/)` 打开右侧辅助面板。
 
 ---
 
