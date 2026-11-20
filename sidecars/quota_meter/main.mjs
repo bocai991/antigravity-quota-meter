@@ -1,9 +1,9 @@
 // 额度速览 sidecar
 //
-// 轻量设计：
-//   * 不调用任何模型、不消耗 token：只读本地语言服务器的 RetrieveUserQuotaSummary 与 GetAllCascadeTrajectories。
-//   * 按 mtime:size 缓存解析本地 transcript.jsonl，自动把额度消耗按时间段与加权 Token 归属到「对话列表」中的各个对话任务。
-//   * 支持多对话并行自动统计，也支持多任务同时手动掐表计量（默认使用对话列表标题命名）。
+// 轻量与低延迟设计：
+//   * 0 Token 消耗：只读本机语言服务器的 RetrieveUserQuotaSummary 与 GetAllCascadeTrajectories。
+//   * 标题零延迟兜底：持久化缓存对话标题 db.titles，并在语言服务器尚未懒加载工作区对话时直接从本地 transcript.jsonl 首条请求提取标题，彻底消除“对话 9d463d”占位名。
+//   * 事件驱动采样：检测到本地任意对话新增模型调用步数时（且距上次采样 >15 秒），自动立即刷新一次额度；空闲时维持低频轮询。
 import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -35,17 +35,24 @@ function findBrainDir() {
 
 // ---------- 持久化 ----------
 function load() {
-  const empty = { settings: { ...DEFAULTS }, samples: [], meta: {}, marks: [], runs: [], alerts: {}, events: [] };
+  const empty = { settings: { ...DEFAULTS }, samples: [], meta: {}, titles: {}, alerts: {}, events: [] };
   try {
     const d = JSON.parse(readFileSync(FILE, 'utf-8'));
-    const marks = Array.isArray(d.marks) ? d.marks : d.mark ? [{ id: 'm0', ...d.mark }] : [];
-    return { ...empty, ...d, marks, settings: { ...DEFAULTS, ...(d.settings || {}) } };
+    return {
+      ...empty,
+      ...d,
+      titles: d.titles && typeof d.titles === 'object' ? d.titles : {},
+      settings: { ...DEFAULTS, ...(d.settings || {}) },
+    };
   } catch {
     return empty;
   }
 }
 let db = load();
 delete db.mark;
+delete db.marks;
+delete db.runs;
+
 let saveTimer = null;
 function save() {
   clearTimeout(saveTimer);
@@ -80,33 +87,49 @@ async function lsrpc(method, body = {}) {
 
 let trajCache = { at: 0, map: {} };
 async function fetchTrajectories(force = false) {
-  if (!force && Date.now() - trajCache.at < 8000 && Object.keys(trajCache.map).length) return trajCache.map;
+  if (!force && Date.now() - trajCache.at < 3000 && Object.keys(trajCache.map).length) return trajCache.map;
   try {
     const r = await lsrpc('GetAllCascadeTrajectories');
-    trajCache = { at: Date.now(), map: r.trajectorySummaries || {} };
+    const map = r.trajectorySummaries || {};
+    trajCache = { at: Date.now(), map };
+    let dirty = false;
+    for (const [id, info] of Object.entries(map)) {
+      const t = (info?.annotations?.title || info?.summary || '').trim();
+      if (t && db.titles[id] !== t) {
+        db.titles[id] = t;
+        dirty = true;
+      }
+    }
+    if (dirty) save();
   } catch {}
   return trajCache.map;
 }
 
+let pollInFlight = null;
 async function poll(force = false) {
-  try {
-    const [r] = await Promise.all([lsrpc('RetrieveUserQuotaSummary'), fetchTrajectories(true)]);
-    live = { groups: r.groups || [], description: r.description || '', fetchedAt: Date.now(), error: null };
-    const v = {};
-    for (const g of live.groups) {
-      for (const b of g.buckets || []) {
-        v[b.bucketId] = frac(b);
-        db.meta[b.bucketId] = { group: g.displayName, window: b.window, reset: b.resetTime };
+  if (pollInFlight) return pollInFlight;
+  pollInFlight = (async () => {
+    try {
+      const [r] = await Promise.all([lsrpc('RetrieveUserQuotaSummary'), fetchTrajectories(true)]);
+      live = { groups: r.groups || [], description: r.description || '', fetchedAt: Date.now(), error: null };
+      const v = {};
+      for (const g of live.groups) {
+        for (const b of g.buckets || []) {
+          v[b.bucketId] = frac(b);
+          db.meta[b.bucketId] = { group: g.displayName, window: b.window, reset: b.resetTime };
+        }
       }
+      record(v, force);
+      checkAlerts();
+      return true;
+    } catch (e) {
+      live = { ...live, error: String(e.message || e) };
+      return false;
+    } finally {
+      pollInFlight = null;
     }
-    record(v, force);
-    checkAlerts();
-    backfillUnnamedLabels();
-    return true;
-  } catch (e) {
-    live = { ...live, error: String(e.message || e) };
-    return false;
-  }
+  })();
+  return pollInFlight;
 }
 
 function record(v, force) {
@@ -134,7 +157,7 @@ function rateFor(id) {
   for (let i = db.samples.length - 1; i >= 0; i--) {
     const s = db.samples[i];
     if (s.v[id] === undefined || now - s.t > RATE_WINDOW) break;
-    if (pts.length && s.v[id] < pts.at(-1).v - 0.04) break; // 中间发生过回血重置
+    if (pts.length && s.v[id] < pts.at(-1).v - 0.04) break;
     pts.push({ t: s.t, v: s.v[id] });
   }
   if (pts.length < 2) return null;
@@ -216,7 +239,7 @@ function toast(title, body) {
   );
 }
 
-// ---------- 功能 3：按「对话列表」自动统计并行任务油耗 + 多任务手动掐表 ----------
+// ---------- 功能 3：按「对话列表」自动统计并行任务油耗 ----------
 const poolOfModel = (m) => (/argon/i.test(m) ? 'Gemini 4 Argon' : /claude|gpt|sonnet|opus/i.test(m) ? 'Claude and GPT models' : 'Gemini Models');
 const factorOfModel = (m) => (/flash|hydrogen/i.test(m) ? 0.25 : /opus|carbon/i.test(m) ? 2.5 : 1.0);
 const shortModel = (m) =>
@@ -227,15 +250,17 @@ const shortModel = (m) =>
     .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : ''))
     .join(' ');
 
-const transcriptCache = new Map(); // convId -> { key, steps, models, tokens }
+const transcriptCache = new Map(); // convId -> { key, steps, models, tokens, firstPrompt }
+let lastTotalSteps = 0;
+
 function readTranscriptSteps(brainDir, id) {
-  if (!brainDir) return { steps: [], models: [], tokens: { input: 0, cache: 0, output: 0, total: 0 } };
+  if (!brainDir) return { steps: [], models: [], tokens: { input: 0, cache: 0, output: 0, total: 0 }, firstPrompt: '' };
   const p = join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl');
   let st;
   try {
     st = statSync(p);
   } catch {
-    return { steps: [], models: [], tokens: { input: 0, cache: 0, output: 0, total: 0 } };
+    return { steps: [], models: [], tokens: { input: 0, cache: 0, output: 0, total: 0 }, firstPrompt: '' };
   }
   const key = `${st.mtimeMs}:${st.size}`;
   const hit = transcriptCache.get(id);
@@ -244,8 +269,16 @@ function readTranscriptSteps(brainDir, id) {
   const steps = [];
   const modelSet = new Set();
   const tokens = { input: 0, cache: 0, output: 0, total: 0 };
+  let firstPrompt = '';
   try {
     for (const line of readFileSync(p, 'utf-8').split('\n')) {
+      if (!firstPrompt && line.includes('"USER_INPUT"')) {
+        try {
+          const u = JSON.parse(line);
+          const m = /<USER_REQUEST>\s*([^\r\n<]+)/.exec(u.content || '');
+          if (m) firstPrompt = m[1].trim().slice(0, 28);
+        } catch {}
+      }
       if (!line.includes('"PLANNER_RESPONSE"')) continue;
       const obj = JSON.parse(line);
       if (obj.type !== 'PLANNER_RESPONSE' || !obj.model) continue;
@@ -262,12 +295,11 @@ function readTranscriptSteps(brainDir, id) {
       modelSet.add(shortModel(obj.model));
     }
   } catch {}
-  const val = { key, steps, models: [...modelSet], tokens };
+  const val = { key, steps, models: [...modelSet], tokens, firstPrompt };
   transcriptCache.set(id, val);
   return val;
 }
 
-// 从采样序列提取每一次真实的额度下降事件（自动识别 >4% 的回血重置并忽略 <0.4% 的服务端副本抖动）
 function extractDrops(sinceT = 0) {
   const samples = db.samples;
   if (!samples.length) return [];
@@ -304,31 +336,59 @@ function extractDrops(sinceT = 0) {
   return drops;
 }
 
+function resolveTitle(id, info, firstPrompt) {
+  const liveTitle = (info?.annotations?.title || info?.summary || '').trim();
+  if (liveTitle) {
+    if (db.titles[id] !== liveTitle) {
+      db.titles[id] = liveTitle;
+      save();
+    }
+    return liveTitle;
+  }
+  if (db.titles[id]) return db.titles[id];
+  if (firstPrompt) return firstPrompt;
+  return `对话 ${id.slice(0, 6)}`;
+}
+
 function buildConversationStats() {
   const brainDir = findBrainDir();
   const summaries = trajCache.map || {};
   const convMap = new Map();
 
-  // 1. 收集 GetAllCascadeTrajectories 中的对话列表
   for (const [id, info] of Object.entries(summaries)) {
     const rootId = info.trajectoryMetadata?.rootConversationId || id;
     if (rootId !== id) continue;
-    const title = info.annotations?.title || info.summary || `对话 ${id.slice(0, 6)}`;
     const status = info.status === 'CASCADE_RUN_STATUS_RUNNING' ? 'running' : 'idle';
     const createdAt = Date.parse(info.createdTime) || 0;
     const updatedAt = Date.parse(info.lastModifiedTime || info.lastUserInputTime || info.createdTime) || 0;
-    convMap.set(id, { id, title, status, createdAt, updatedAt, stepCount: info.stepCount || 0, steps: [], models: new Set(), tokens: { input: 0, cache: 0, output: 0, total: 0 }, used: {}, resets: {} });
+    convMap.set(id, {
+      id,
+      info,
+      title: resolveTitle(id, info, ''),
+      status,
+      createdAt,
+      updatedAt,
+      stepCount: info.stepCount || 0,
+      steps: [],
+      models: new Set(),
+      tokens: { input: 0, cache: 0, output: 0, total: 0 },
+      used: {},
+      resets: {},
+    });
   }
 
-  // 2. 合并本地 brain 目录下的 transcript.jsonl 步骤（子代理归入根对话）
   const ids = new Set([...convMap.keys(), ...(brainDir ? readdirSync(brainDir).filter((d) => /^[0-9a-f-]{20,}$/i.test(d)) : [])]);
+  let totalStepsNow = 0;
   for (const id of ids) {
     const info = summaries[id];
     const rootId = info?.trajectoryMetadata?.rootConversationId || id;
+    const { steps, models, tokens, firstPrompt } = readTranscriptSteps(brainDir, id);
     if (!convMap.has(rootId)) {
+      if (!steps.length && !info) continue;
       convMap.set(rootId, {
         id: rootId,
-        title: info?.annotations?.title || info?.summary || `对话 ${rootId.slice(0, 6)}`,
+        info,
+        title: resolveTitle(rootId, info, firstPrompt),
         status: info?.status === 'CASCADE_RUN_STATUS_RUNNING' ? 'running' : 'idle',
         createdAt: 0,
         updatedAt: 0,
@@ -341,8 +401,9 @@ function buildConversationStats() {
       });
     }
     const target = convMap.get(rootId);
-    const { steps, models, tokens } = readTranscriptSteps(brainDir, id);
+    if (rootId === id) target.title = resolveTitle(rootId, target.info || info, firstPrompt);
     target.steps.push(...steps);
+    totalStepsNow += steps.length;
     for (const m of models) target.models.add(m);
     target.tokens.input += tokens.input;
     target.tokens.cache += tokens.cache;
@@ -355,7 +416,12 @@ function buildConversationStats() {
     }
   }
 
-  // 3. 将每次额度下降按时间窗口内的加权 Token 分摊到对应对话
+  // 若检测到对话刚刚产生了新的模型调用步数，且距上次额度拉取 >15s，异步触发一次即时额度采样
+  if (lastTotalSteps > 0 && totalStepsNow > lastTotalSteps && Date.now() - live.fetchedAt > 15e3) {
+    poll(false);
+  }
+  lastTotalSteps = totalStepsNow;
+
   const allDrops = extractDrops(0);
   for (const d of allDrops) {
     const weights = new Map();
@@ -405,82 +471,8 @@ function buildConversationStats() {
     .sort((a, b) => (b.status === 'running') - (a.status === 'running') || b.updatedAt - a.updatedAt);
 }
 
-// 计算某段手动掐表 [startT, endT] 的额度消耗（如果绑定了 convId，则只算该对话分摊到的消耗）
-function usedInInterval(startT, endT = Infinity, convId = '') {
-  const used = {}, resets = {};
-  for (const k of Object.keys(db.meta)) used[k] = 0;
-  const drops = extractDrops(startT).filter((d) => !d.pre && d.t1 <= endT + 1000);
-  if (!convId) {
-    for (const d of drops) {
-      used[d.bucket] = (used[d.bucket] || 0) + d.drop;
-      if (d.reset) resets[d.bucket] = true;
-    }
-    return { used, resets };
-  }
-  const brainDir = findBrainDir();
-  const summaries = trajCache.map || {};
-  const convSteps = new Map();
-  for (const id of Object.keys(summaries)) {
-    const rootId = summaries[id]?.trajectoryMetadata?.rootConversationId || id;
-    const { steps } = readTranscriptSteps(brainDir, id);
-    convSteps.set(rootId, [...(convSteps.get(rootId) || []), ...steps]);
-  }
-  for (const d of drops) {
-    let myW = 0, totalW = 0;
-    for (const [id, steps] of convSteps.entries()) {
-      const w = steps.filter((st) => st.pool === d.pool && st.t >= d.t0 - 120e3 && st.t <= d.t1 + 45e3).reduce((a, x) => a + x.w, 0);
-      totalW += w;
-      if (id === convId) myW += w;
-    }
-    const share = totalW > 0 ? myW / totalW : 0;
-    if (share > 0) {
-      used[d.bucket] = (used[d.bucket] || 0) + d.drop * share;
-      if (d.reset) resets[d.bucket] = true;
-    }
-  }
-  return { used, resets };
-}
-
-// 根据时间区间匹配当时活跃的对话列表标题，用于默认命名及自动回填历史“未命名任务”
-function inferTitleForWindow(startT, endT = Date.now(), convId = '') {
-  const convs = buildConversationStats();
-  if (convId) {
-    const hit = convs.find((c) => c.id === convId);
-    if (hit) return hit.title;
-  }
-  const brainDir = findBrainDir();
-  const activeTitles = [];
-  for (const c of convs) {
-    const { steps } = readTranscriptSteps(brainDir, c.id);
-    if (steps.some((st) => st.t >= startT - 60e3 && st.t <= endT + 60e3)) activeTitles.push(c.title);
-  }
-  if (activeTitles.length) return activeTitles.slice(0, 2).join(' + ');
-  const running = convs.filter((c) => c.status === 'running').map((c) => c.title);
-  if (running.length) return running.slice(0, 2).join(' + ');
-  return convs[0]?.title || '对话任务';
-}
-
-function backfillUnnamedLabels() {
-  if (!Object.keys(trajCache.map).length) return;
-  let dirty = false;
-  for (const m of db.marks) {
-    if (!m.label || m.label === '未命名任务') {
-      m.label = inferTitleForWindow(m.t, Date.now(), m.convId);
-      dirty = true;
-    }
-  }
-  for (const r of db.runs) {
-    if (!r.label || r.label === '未命名任务') {
-      r.label = inferTitleForWindow(r.start, r.end, r.convId);
-      dirty = true;
-    }
-  }
-  if (dirty) save();
-}
-
 // ---------- 对外状态 ----------
 function state() {
-  backfillUnnamedLabels();
   const groups = live.groups.map((g) => ({
     name: g.displayName,
     description: g.description || '',
@@ -494,12 +486,6 @@ function state() {
       series: seriesFor(b.bucketId, b.window),
     })),
   }));
-  const conversations = buildConversationStats();
-  const marks = db.marks.map((m) => ({
-    ...m,
-    label: m.label || inferTitleForWindow(m.t, Date.now(), m.convId),
-    ...usedInInterval(m.t, Infinity, m.convId),
-  }));
   return {
     groups,
     description: live.description,
@@ -507,10 +493,7 @@ function state() {
     error: live.error,
     settings: db.settings,
     meta: db.meta,
-    conversations,
-    marks,
-    mark: marks[0] || null, // 兼容旧字段
-    runs: db.runs,
+    conversations: buildConversationStats(),
     events: db.events.slice(-10).reverse(),
     now: Date.now(),
   };
@@ -536,41 +519,12 @@ app.api('/api/state', async () => {
 
 let lastManual = 0;
 app.api('/api/refresh', async () => {
-  if (Date.now() - lastManual > 5e3) {
+  if (Date.now() - lastManual > 3e3) {
     lastManual = Date.now();
     await poll(true);
   } else {
     await fetchTrajectories(true);
   }
-  return state();
-});
-
-app.api('/api/mark', async (d) => {
-  if (d.action === 'start') {
-    if (!(await poll(true))) return { error: live.error };
-    const convId = String(d.convId || '');
-    const rawLabel = String(d.label || '').trim().slice(0, 60);
-    const label = rawLabel || inferTitleForWindow(Date.now() - 5 * MIN, Date.now(), convId);
-    const id = 'm' + Date.now().toString(36);
-    db.marks.push({ id, t: Date.now(), convId, label, v: { ...db.samples.at(-1).v } });
-  } else if (d.action === 'stop') {
-    await poll(true);
-    const idx = d.id ? db.marks.findIndex((m) => m.id === d.id) : 0;
-    if (idx >= 0 && db.marks[idx]) {
-      const m = db.marks[idx];
-      const { used, resets } = usedInInterval(m.t, Date.now(), m.convId);
-      const label = m.label || inferTitleForWindow(m.t, Date.now(), m.convId);
-      db.runs.unshift({ label, convId: m.convId || '', start: m.t, end: Date.now(), used, resets });
-      db.runs = db.runs.slice(0, 15);
-      db.marks.splice(idx, 1);
-    }
-  } else if (d.action === 'cancel') {
-    const idx = d.id ? db.marks.findIndex((m) => m.id === d.id) : 0;
-    if (idx >= 0) db.marks.splice(idx, 1);
-  } else if (d.action === 'clearRuns') {
-    db.runs = [];
-  }
-  save();
   return state();
 });
 
