@@ -1,0 +1,6 @@
+{
+  "name": "quota_meter",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Antigravity quota meter sidecar"
+}

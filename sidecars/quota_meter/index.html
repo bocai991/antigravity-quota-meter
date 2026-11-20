@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>额度</title>
+<script src="/preload.js"></script>
+<style>
+  :root {
+    color-scheme: light dark;
+    --fg: var(--foreground, #1f1f1f);
+    --bg: var(--background, #f7f7f7);
+    --mut: var(--muted-foreground, #777);
+    --card-bg: var(--card, color-mix(in srgb, var(--fg) 4%, transparent));
+    --line: var(--border, color-mix(in srgb, var(--fg) 12%, transparent));
+    --track: color-mix(in srgb, var(--fg) 10%, transparent);
+    --ok: #4caf50; --warn: #f0a020; --crit: #e5484d;
+  }
+  @media (prefers-color-scheme: dark) { :root { --fg: var(--foreground, #ececec); --bg: var(--background, #0a0a0a); --mut: var(--muted-foreground, #999); } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:13px/1.45 var(--font-family, system-ui,"Segoe UI","Microsoft YaHei",sans-serif); color:var(--fg); background:var(--bg); }
+  .wrap { padding:12px; max-width:600px; margin:0 auto; }
+  header { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; gap:8px; }
+  header h1 { font-size:14px; margin:0; font-weight:600; }
+  button, select, input { font:inherit; color:var(--fg); background:transparent; border:1px solid var(--line); border-radius:8px; padding:3px 9px; }
+  button { cursor:pointer; color:var(--mut); }
+  button:hover { color:var(--fg); }
+  button.primary { color:var(--fg); border-color:color-mix(in srgb, var(--ok) 60%, transparent); }
+  .card { background:var(--card-bg); border:1px solid var(--line); border-radius:12px; padding:10px 12px; margin-bottom:10px; }
+  .gname { font-weight:600; display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .chip { font-size:11.5px; font-weight:600; padding:1px 7px; border-radius:10px; }
+  details.models { margin:2px 0 4px; }
+  details.models summary { cursor:pointer; color:var(--mut); font-size:11.5px; list-style:none; }
+  details.models summary::before { content:'▸ '; }
+  details.models[open] summary::before { content:'▾ '; }
+  .tag { display:inline-block; font-size:11px; padding:1px 6px; margin:3px 4px 0 0; border:1px solid var(--line); border-radius:6px; color:var(--mut); }
+  .row { padding:7px 0 5px; border-top:1px solid var(--line); }
+  .row:first-of-type { border-top:none; }
+  .top { display:flex; justify-content:space-between; gap:8px; }
+  .pct { font-weight:600; font-variant-numeric:tabular-nums; }
+  .bar { height:5px; border-radius:3px; background:var(--track); margin:5px 0 3px; overflow:hidden; }
+  .bar > i { display:block; height:100%; border-radius:3px; }
+  svg.spark { display:block; width:100%; height:24px; margin:2px 0; }
+  .sub { color:var(--mut); font-size:12px; }
+  .advice { border-radius:10px; padding:8px 10px; margin-bottom:10px; font-size:12.5px; border:1px solid; }
+  .advice p { margin:0; } .advice p + p { margin-top:5px; }
+  .advice.ok { border-color:color-mix(in srgb,var(--ok) 40%,transparent); background:color-mix(in srgb,var(--ok) 8%,transparent); }
+  .advice.warn { border-color:color-mix(in srgb,var(--warn) 50%,transparent); background:color-mix(in srgb,var(--warn) 10%,transparent); }
+  .advice.crit { border-color:color-mix(in srgb,var(--crit) 50%,transparent); background:color-mix(in srgb,var(--crit) 10%,transparent); }
+  h2 { font-size:13px; margin:0 0 6px; font-weight:600; display:flex; justify-content:space-between; align-items:center; }
+  .meter-form { display:flex; gap:6px; } .meter-form input { flex:1; min-width:0; }
+  .kv { display:flex; justify-content:space-between; gap:8px; font-size:12px; padding:2px 0; }
+  .kv span:last-child { font-variant-numeric:tabular-nums; }
+  .run { border-top:1px solid var(--line); padding:6px 0; }
+  .run:first-child { border-top:none; }
+  .btns { display:flex; gap:6px; margin-top:6px; }
+  .ev { font-size:12px; padding:3px 0; border-top:1px solid var(--line); }
+  .ev:first-child { border-top:none; }
+  .set { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:4px 0; font-size:12.5px; }
+  .set input[type=number] { width:64px; }
+  .foot { color:var(--mut); font-size:11.5px; text-align:center; margin-top:4px; }
+  .err { color:var(--crit); white-space:pre-wrap; }
+  details.sec > summary { cursor:pointer; font-weight:600; font-size:13px; }
+  body.compact .wrap { padding:8px; }
+  body.compact .card { padding:8px 10px; margin-bottom:8px; }
+  body.compact .full-only { display:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header><h1>额度速览</h1><button id="refresh" title="立即刷新">刷新</button></header>
+  <div id="advice"></div>
+  <div id="pools"><div class="sub">加载中…</div></div>
+  <div id="meter"></div>
+  <div id="extra" class="full-only"></div>
+  <div class="foot" id="foot"></div>
+</div>
+<script>
+const compact = new URLSearchParams(location.search).get('mode') === 'compact';
+if (compact) document.body.classList.add('compact');
+
+const MIN = 60e3, HOUR = 60 * MIN;
+const GROUP_ZH = { 'Gemini Models':'Gemini 模型', 'Claude and GPT models':'Claude 与 GPT 模型', 'Gemini 4 Argon':'Gemini 4 Argon' };
+const WIN_ZH = { '5h':'5 小时', weekly:'每周' };
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const color = f => f > 0.5 ? 'var(--ok)' : f > 0.2 ? 'var(--warn)' : 'var(--crit)';
+const pct = f => (f * 100).toFixed(f > 0 && f < 0.1 ? 1 : 0) + '%';
+const dpct = f => (f * 100).toFixed(f < 0.01 ? 2 : 1) + '%';
+const gz = name => GROUP_ZH[name] || name;
+const api = (path, body) => (window.sidecar?.fetch || fetch)(path, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body || {}) }).then(r => r.json());
+
+function dur(ms) {
+  if (!(ms > 0)) return '0分钟';
+  const m = Math.round(ms / MIN), d = Math.floor(m / 1440), h = Math.floor(m % 1440 / 60);
+  return d ? `${d}天${h}小时` : h ? `${h}小时${m % 60}分` : `${m % 60}分钟`;
+}
+const resetMs = b => Date.parse(b.reset) - Date.now();
+const etaMs = b => b.ratePerHour > 0.001 ? b.frac / b.ratePerHour * HOUR : null;
+const models = g => {
+  const m = /Models within this group:\s*(.+)$/i.exec(g.description || '');
+  return m ? m[1].split(',').map(s => s.trim()).filter(Boolean) : [g.name];
+};
+
+let S = null;
+
+// ---------- 功能 4：切换建议 ----------
+function renderAdvice() {
+  const th = S.settings.threshold / 100;
+  const pools = S.groups.filter(g => g.buckets.length).map(g => {
+    const lim = g.buckets.reduce((a, b) => b.frac < a.frac ? b : a);
+    return { g, lim, eff: lim.frac, eta: etaMs(lim) };
+  });
+  const msgs = [];
+  for (const p of pools) {
+    const soon = p.eta != null && p.eta < 45 * MIN && p.eta < resetMs(p.lim);
+    if (p.eff >= th && !soon) continue;
+    const alt = pools.filter(q => q !== p && q.eff >= Math.max(th, 0.3)).sort((a, b) => b.eff - a.eff)[0];
+    let t = `<b>${esc(gz(p.g.name))}</b> ${WIN_ZH[p.lim.window] || ''}额度${p.eff < 0.02 ? '已用完' : '仅剩 ' + pct(p.eff)}`;
+    if (soon && p.eff >= 0.02) t += `，按当前速度约 ${dur(p.eta)}后耗尽`;
+    t += `，${dur(resetMs(p.lim))}后重置。`;
+    t += alt ? `建议先切换到 <b>${esc(gz(alt.g.name))}</b>（剩 ${pct(alt.eff)}，如 ${esc(models(alt.g)[0])}）。`
+             : '其他池子也不充裕，建议缩小任务或等待重置。';
+    msgs.push({ level: p.eff < 0.05 ? 'crit' : 'warn', t });
+  }
+  const level = msgs.some(m => m.level === 'crit') ? 'crit' : msgs.length ? 'warn' : 'ok';
+  if (!msgs.length) msgs.push({ t: '三个额度池都充足，可以放心使用。' });
+  document.getElementById('advice').innerHTML = `<div class="advice ${level}">${msgs.map(m => `<p>${m.t}</p>`).join('')}</div>`;
+}
+
+// ---------- 额度池 + 功能 1：速率 / 曲线 ----------
+function spark(series, f) {
+  const pts = series?.pts;
+  if (!pts || pts.length < 2) return '';
+  const now = S.now, W = 300, H = 24;
+  const all = pts.at(-1)[0] < now - 10e3 ? [...pts, [now, f]] : pts;
+  const span = Math.max(5 * MIN, now - all[0][0]);
+  const xy = all.map(([t, v]) => `${Math.max(0, Math.min(W, W * (1 - (now - t) / span))).toFixed(1)},${(2 + (H - 4) * (1 - v)).toFixed(1)}`);
+  return `<svg class="spark full-only" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <line x1="0" y1="${H - 2}" x2="${W}" y2="${H - 2}" stroke="var(--line)" stroke-width="1"/>
+    <polyline points="${xy.join(' ')}" fill="none" stroke="${color(f)}" stroke-width="1.6" vector-effect="non-scaling-stroke"/></svg>`;
+}
+
+function bucketSub(b) {
+  const reset = b.reset ? `${dur(resetMs(b))}后重置` : '';
+  if (b.ratePerHour == null) return b.frac >= 1 ? '未使用' : `正在采集消耗速度… · ${reset}`;
+  if (b.ratePerHour <= 0.001) return `近 45 分钟未消耗 · ${reset}`;
+  const eta = etaMs(b);
+  const r = `消耗 ${dpct(b.ratePerHour)}/小时`;
+  return eta < resetMs(b) ? `${r} · <b style="color:var(--warn)">约 ${dur(eta)}后耗尽</b> · ${reset}` : `${r} · 重置前用不完 · ${reset}`;
+}
+
+function renderPools() {
+  const order = { '5h': 0, weekly: 1 };
+  document.getElementById('pools').innerHTML = S.groups.map(g => {
+    const bs = [...g.buckets].sort((a, b) => (order[a.window] ?? 9) - (order[b.window] ?? 9));
+    const min = Math.min(...bs.map(b => b.frac));
+    return `<div class="card">
+      <div class="gname"><span>${esc(gz(g.name))}</span><span class="chip" style="color:${color(min)};background:color-mix(in srgb, ${color(min)} 14%, transparent)">${pct(min)}</span></div>
+      <details class="models full-only"><summary>包含模型</summary>${models(g).map(m => `<span class="tag">${esc(m)}</span>`).join('')}</details>
+      ${bs.map(b => `<div class="row">
+        <div class="top"><span>${WIN_ZH[b.window] ? WIN_ZH[b.window] + '剩余限额' : esc(b.label)}</span><span class="pct">剩余 ${pct(b.frac)}</span></div>
+        <div class="bar"><i style="width:${b.frac * 100}%;background:${color(b.frac)}"></i></div>
+        ${spark(b.series, b.frac)}
+        <div class="sub">${bucketSub(b)}</div>
+      </div>`).join('')}
+    </div>`;
+  }).join('') || '<div class="sub">没有额度数据</div>';
+}
+
+// ---------- 功能 3：任务油耗 ----------
+function usedRows(used, resets) {
+  const groups = {};
+  for (const [id, u] of Object.entries(used || {})) {
+    const m = S.meta[id]; if (!m) continue;
+    (groups[m.group] ||= []).push({ win: m.window, u, reset: resets?.[id] });
+  }
+  const rows = Object.entries(groups).filter(([, a]) => a.some(x => x.u > 0.00005));
+  if (!rows.length) return '<div class="sub">暂未检测到额度变化</div>';
+  return rows.map(([g, a]) => `<div class="kv"><span>${esc(gz(g))}</span><span>${
+    a.sort((x, y) => (x.win === '5h' ? 0 : 1) - (y.win === '5h' ? 0 : 1))
+     .map(x => `${WIN_ZH[x.win] || x.win} ${dpct(x.u)}${x.reset ? '*' : ''}`).join(' · ')}</span></div>`).join('')
+    + (Object.values(resets || {}).some(Boolean) ? '<div class="sub">* 期间发生过重置，数值可能略低</div>' : '');
+}
+
+function renderMeter() {
+  const el = document.getElementById('meter');
+  const m = S.mark;
+  const prevIn = document.getElementById('mlabel');
+  const keep = prevIn ? { v: prevIn.value, f: document.activeElement === prevIn } : null;
+  let h = '<div class="card"><h2>任务油耗计量</h2>';
+  if (!m) {
+    h += `<div class="meter-form"><input id="mlabel" placeholder="任务名，如：用 Neon 重构登录（可选）" maxlength="60"/><button class="primary" id="mstart">开始计量</button></div>
+          <div class="sub" style="margin-top:4px">开始一个任务前点一下，结束后点"结束"，即可看到这次任务消耗了多少额度。</div>`;
+  } else {
+    h += `<div class="kv"><span>⏱ ${esc(m.label || '未命名任务')}</span><span>已进行 ${dur(S.now - m.t)}</span></div>
+          ${usedRows(m.used, m.resets)}
+          <div class="btns"><button class="primary" id="mstop">结束并保存</button><button id="mcancel">放弃</button></div>`;
+  }
+  if (S.runs.length && !compact) {
+    h += `<h2 style="margin-top:10px">历史记录 <button id="mclear" style="font-size:11px;padding:1px 7px">清空</button></h2>`;
+    h += S.runs.slice(0, 10).map(r => `<div class="run"><div class="kv"><b>${esc(r.label || '未命名任务')}</b><span class="sub">${new Date(r.start).toLocaleString('zh-CN', { month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit' })} · ${dur(r.end - r.start)}</span></div>${usedRows(r.used, r.resets)}</div>`).join('');
+  }
+  el.innerHTML = h + '</div>';
+  const $ = id => document.getElementById(id);
+  if (keep && $('mlabel')) { $('mlabel').value = keep.v; if (keep.f) $('mlabel').focus(); }
+  $('mstart') && ($('mstart').onclick = async () => { $('mstart').disabled = true; S = await api('api/mark', { action:'start', label:$('mlabel').value }); if (S.error && !S.groups) alert(S.error); load(); });
+  $('mstop') && ($('mstop').onclick = async () => { $('mstop').disabled = true; S = await api('api/mark', { action:'stop' }); render(); });
+  $('mcancel') && ($('mcancel').onclick = async () => { if (confirm('放弃本次计量？')) { S = await api('api/mark', { action:'cancel' }); render(); } });
+  $('mclear') && ($('mclear').onclick = async () => { if (confirm('清空全部历史记录？')) { S = await api('api/mark', { action:'clearRuns' }); render(); } });
+}
+
+// ---------- 功能 2：提醒记录 + 设置 ----------
+let extraOpen = { ev:false, set:false };
+function renderExtra() {
+  const s = S.settings;
+  const ev = S.events.length
+    ? S.events.map(e => `<div class="ev"><b>${esc(e.title)}</b> · ${esc(e.body)} <span class="sub">${new Date(e.t).toLocaleString('zh-CN', { month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit' })}</span></div>`).join('')
+    : '<div class="sub">暂无提醒</div>';
+  document.getElementById('extra').innerHTML = `
+    <div class="card"><details class="sec" id="dev" ${extraOpen.ev ? 'open' : ''}><summary>最近提醒（${S.events.length}）</summary><div style="margin-top:6px">${ev}</div></details></div>
+    <div class="card"><details class="sec" id="dset" ${extraOpen.set ? 'open' : ''}><summary>提醒与刷新设置</summary><div style="margin-top:6px">
+      <div class="set"><span>低于多少时提醒（%）</span><input type="number" id="sth" min="5" max="60" value="${s.threshold}"/></div>
+      <div class="set"><span>弹出系统通知</span><input type="checkbox" id="snt" ${s.notify ? 'checked' : ''}/></div>
+      <div class="set"><span>额度恢复时也通知</span><input type="checkbox" id="snr" ${s.notifyRecover ? 'checked' : ''}/></div>
+      <div class="set"><span>后台刷新间隔</span><select id="spm">${[1, 2, 5, 10].map(n => `<option value="${n}" ${s.pollMin == n ? 'selected' : ''}>${n} 分钟</option>`).join('')}</select></div>
+      <div class="set"><span class="sub">额度用到 5% 以下会再提醒一次；每个阈值只提醒一次，恢复后重新计算。</span><button id="stest">测试通知</button></div>
+    </div></details></div>`;
+  const $ = id => document.getElementById(id);
+  $('dev').ontoggle = e => extraOpen.ev = e.target.open;
+  $('dset').ontoggle = e => extraOpen.set = e.target.open;
+  const upd = async body => { S = await api('api/settings', body); render(); };
+  $('sth').onchange = e => upd({ threshold: +e.target.value });
+  $('snt').onchange = e => upd({ notify: e.target.checked });
+  $('snr').onchange = e => upd({ notifyRecover: e.target.checked });
+  $('spm').onchange = e => upd({ pollMin: +e.target.value });
+  $('stest').onclick = () => api('api/test-notify');
+}
+
+function render() {
+  if (!S) return;
+  S.now = Date.now();
+  if (S.error && !S.groups?.length) {
+    document.getElementById('pools').innerHTML = `<div class="card err">${esc(S.error)}</div>`;
+    return;
+  }
+  renderAdvice(); renderPools(); renderMeter();
+  if (!compact) renderExtra();
+  document.getElementById('foot').textContent = (S.error ? '⚠ 最近一次刷新失败 · ' : '') +
+    '更新于 ' + new Date(S.fetchedAt).toLocaleTimeString('zh-CN') + ` · 后台每 ${S.settings.pollMin} 分钟刷新 · 不消耗 token`;
+}
+
+async function load() {
+  try { S = await (await fetch('api/state')).json(); }
+  catch (e) { S = { error: '无法连接额度服务：' + e.message, groups: [] }; }
+  render();
+}
+document.getElementById('refresh').onclick = async e => { e.target.disabled = true; S = await api('api/refresh'); render(); e.target.disabled = false; };
+load();
+// 面板可见时才拉取（只读后台缓存，不会触发额外的额度查询）
+setInterval(() => document.visibilityState === 'visible' && load(), 60e3);
+document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && load());
+</script>
+</body>
+</html>
