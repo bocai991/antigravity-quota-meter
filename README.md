@@ -1,6 +1,6 @@
 # Antigravity Quota Meter（额度速览）
 
-一个轻量级 **Google Antigravity** 原生 UI 插件（Sidecar），无需进入设置页面，即可在侧边栏或右侧辅助面板随时查看三个额度池（**Gemini 模型**、**Claude 与 GPT 模型**、**Gemini 4 Argon**）的实时剩余比例、消耗速率与重置时间。
+一个轻量级 **Google Antigravity** 原生 UI 插件（Sidecar），无需进入设置页面，即可在左侧导航栏的 **「扩展」** 区域或对话右侧辅助面板随时查看三个额度池（**Gemini 模型**、**Claude 与 GPT 模型**、**Gemini 4 Argon**）的实时剩余比例、消耗速率与重置时间。
 
 > **零 Token 消耗**：本插件不调用任何大模型，仅只读查询本机 Antigravity 语言服务器的 `RetrieveUserQuotaSummary` 接口。
 
@@ -59,8 +59,8 @@ git clone https://github.com/bocai991/antigravity-quota-meter.git ~/.gemini/conf
 
 ## 使用方式
 
-- **从侧边栏打开**：点击侧边栏中的 **“额度”** 入口（紧凑视图）。
-- **从对话标题栏打开**：点击对话右上角的 **`+`** 菜单，选择 **“额度”** 打开右侧辅助面板（完整视图）。
+- **从左侧「扩展」区域打开**：在左侧导航栏的 **「扩展」** 栏下点击 **“额度”**。
+- **从对话标题栏打开**：点击对话右上角的 **`+`** 菜单，选择 **“额度”** 打开右侧辅助面板。
 - **在对话中一键打开**：在 Antigravity 对话中点击链接 `sidecar://quota-meter/quota_meter/`。
 
 ---

@@ -12,7 +12,7 @@
     "display_name": "额度",
     "views": [
       {
-        "path": "/?mode=compact",
+        "path": "/",
         "entrypoint": "SIDECAR_UI_ENTRYPOINT_SIDEBAR",
         "title": "额度"
       },
