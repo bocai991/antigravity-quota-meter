@@ -53,13 +53,14 @@ function findBrainDir() {
 
 // ---------- 持久化 ----------
 function load() {
-  const empty = { settings: { ...DEFAULTS }, samples: [], meta: {}, titles: {}, alerts: {}, events: [] };
+  const empty = { settings: { ...DEFAULTS }, samples: [], meta: {}, titles: {}, alerts: {}, events: [], rateOverrides: {} };
   try {
     const d = JSON.parse(readFileSync(FILE, 'utf-8'));
     return {
       ...empty,
       ...d,
       titles: d.titles && typeof d.titles === 'object' ? d.titles : {},
+      rateOverrides: d.rateOverrides && typeof d.rateOverrides === 'object' ? d.rateOverrides : {},
       settings: { ...DEFAULTS, ...(d.settings || {}) },
     };
   } catch {
@@ -74,6 +75,9 @@ for (const m of Object.values(db.meta || {})) {
 delete db.mark;
 delete db.marks;
 delete db.runs;
+delete db.priceOverrides;
+delete db.settings.currency;
+delete db.settings.fx;
 
 let saveTimer = null;
 function save() {
@@ -318,10 +322,48 @@ function detectPoolChange() {
   notify('额度池结构已变化', `现在共 ${names.length} 个额度池。${parts.join('；')}`);
 }
 
-const factorOfModel = (m) => (/flash|hydrogen/i.test(m) ? 0.25 : /opus|carbon/i.test(m) ? 2.5 : 1.0);
+// ---------- 模型消耗倍率（如 0.5x / 1x / 5x / 10x） ----------
+// 默认倍率见 rates.json；用户在面板中修改后保存在 db.rateOverrides（按模型 id），优先于默认值。
+// 新上线模型若不在 rates.json 中，按名称特征自动给出兜底倍率。
+let rateTable = { baseline: 'Gemini 4 Hydrogen = 1x', note: '', models: [] };
+try {
+  rateTable = JSON.parse(readFileSync(join(__dirname, 'rates.json'), 'utf-8'));
+} catch (e) {
+  console.error('[quota] rates.json 读取失败:', e.message);
+}
+let rateRev = 0;
+const rateKey = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+const guessMult = (m) => {
+  const s = String(m || '');
+  if (/oss|lite|mini|nano/i.test(s)) return 0.5;
+  if (/hydrogen/i.test(s)) return 1;
+  if (/flash|haiku/i.test(s)) return 2;
+  if (/orchestrator/i.test(s)) return /carbon|argon|opus|ultra/i.test(s) ? 6 : 4;
+  if (/opus|ultra/i.test(s)) return 10;
+  if (/carbon|argon/i.test(s)) return 8;
+  return 5;
+};
+function multInfoFor(m) {
+  const key = rateKey(m);
+  let best = null, len = 0;
+  for (const e of rateTable.models || []) {
+    for (const k of [e.id, e.name, ...(e.aliases || [])]) {
+      const n = rateKey(k);
+      if (n && key.startsWith(n) && n.length > len) { best = e; len = n.length; }
+    }
+  }
+  const id = best?.id || key || 'unknown';
+  const ov = db.rateOverrides?.[id];
+  if (ov && Number.isFinite(Number(ov.mult)) && Number(ov.mult) > 0) {
+    return { id, name: best?.name || ov.name || String(m || ''), mult: Number(ov.mult), custom: true };
+  }
+  if (best) return { id, name: best.name, mult: Number(best.mult), custom: false };
+  return { id, name: String(m || ''), mult: guessMult(m), custom: false, estimated: true };
+}
+const multOf = (m) => multInfoFor(m).mult;
 const shortModel = (m) =>
   String(m || '')
-    .replace(/-(high|medium|low)$/i, '')
+    .replace(/-(x?high|medium|low)$/i, '')
     .replace(/(\d)-(\d)/g, '$1.$2')
     .split('-')
     .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : ''))
@@ -378,8 +420,8 @@ function readTranscriptSteps(brainDir, id) {
         entry.tokens.cache += cache;
         entry.tokens.output += out;
         entry.tokens.total += inp + cache + out;
-        const w = Math.max(200, (inp + cache * 0.1 + out * 4) * factorOfModel(obj.model));
-        entry.steps.push({ t, model: obj.model, w });
+        const baseTok = Math.max(200, inp + cache * 0.1 + out * 4);
+        entry.steps.push({ t, model: obj.model, baseTok });
         entry.modelSet.add(shortModel(obj.model));
       }
       entry.models = [...entry.modelSet];
@@ -456,7 +498,7 @@ function buildConversationStats() {
   }
 
   // 先增量刷新各对话 transcript，并生成数据指纹；若指纹未变则直接复用上次归属计算结果
-  const sigParts = [`s:${db.samples.length}:${db.samples.at(-1)?.t || 0}`];
+  const sigParts = [`s:${db.samples.length}:${db.samples.at(-1)?.t || 0}`, `r:${rateRev}`];
   for (const id of activeIdSet) {
     const tr = readTranscriptSteps(brainDir, id);
     const info = summaries[id];
@@ -537,6 +579,11 @@ function buildConversationStats() {
   }
   lastTotalSteps = totalStepsNow;
 
+  // 按模型消耗倍率加权，用于并行任务间的额度扣减分摊
+  for (const c of convMap.values()) {
+    for (const st of c.steps) st.w = st.baseTok * multOf(st.model);
+  }
+
   const allDrops = extractDrops(0);
   for (const d of allDrops) {
     const weights = new Map();
@@ -579,6 +626,7 @@ function buildConversationStats() {
       updatedAt: c.updatedAt,
       modelSteps: c.steps.length,
       models: [...c.models],
+      modelMults: Object.fromEntries([...c.models].map((m) => [m, multOf(m)])),
       tokens: c.tokens,
       used: c.used,
       resets: c.resets,
@@ -589,25 +637,49 @@ function buildConversationStats() {
 }
 
 // ---------- 对外状态 ----------
-function state() {
-  const groups = live.groups.map((g) => ({
-    name: g.displayName,
+function rateState() {
+  const pools = live.groups.map((g) => ({
+    pool: g.displayName,
     label: zhGroup(g.displayName),
-    models: modelListOf(g).length ? modelListOf(g) : [g.displayName],
-    description: g.description || '',
-    buckets: (g.buckets || []).map((b) => ({
-      id: b.bucketId,
-      window: b.window,
-      label: b.displayName,
-      winLabel: winInfo(b.window, b.displayName).label,
-      winKnown: winInfo(b.window, b.displayName).known,
-      winMs: winInfo(b.window, b.displayName).ms,
-      frac: frac(b),
-      reset: b.resetTime,
-      ratePerHour: rateFor(b.bucketId),
-      series: seriesFor(b.bucketId, b.window),
-    })),
+    models: (modelListOf(g).length ? modelListOf(g) : [g.displayName])
+      .map((name) => {
+        const info = multInfoFor(name);
+        return { name, id: info.id, mult: info.mult, custom: !!info.custom };
+      })
+      .sort((a, b) => a.mult - b.mult),
   }));
+  return { baseline: rateTable.baseline || 'Gemini 4 Hydrogen = 1x', note: rateTable.note || '', pools };
+}
+
+function state() {
+  const groups = live.groups.map((g) => {
+    const rawModels = modelListOf(g).length ? modelListOf(g) : [g.displayName];
+    const modelItems = rawModels
+      .map((name) => {
+        const info = multInfoFor(name);
+        return { name, id: info.id, mult: info.mult, custom: !!info.custom };
+      })
+      .sort((a, b) => a.mult - b.mult);
+    return {
+      name: g.displayName,
+      label: zhGroup(g.displayName),
+      models: modelItems.map((x) => x.name),
+      modelItems,
+      description: g.description || '',
+      buckets: (g.buckets || []).map((b) => ({
+        id: b.bucketId,
+        window: b.window,
+        label: b.displayName,
+        winLabel: winInfo(b.window, b.displayName).label,
+        winKnown: winInfo(b.window, b.displayName).known,
+        winMs: winInfo(b.window, b.displayName).ms,
+        frac: frac(b),
+        reset: b.resetTime,
+        ratePerHour: rateFor(b.bucketId),
+        series: seriesFor(b.bucketId, b.window),
+      })),
+    };
+  });
   return {
     groups,
     description: live.description,
@@ -616,6 +688,7 @@ function state() {
     settings: db.settings,
     meta: db.meta,
     conversations: buildConversationStats(),
+    rates: rateState(),
     events: db.events.slice(-10).reverse(),
     now: Date.now(),
   };
@@ -658,6 +731,21 @@ app.api('/api/settings', (d) => {
   if (d.notifyRecover !== undefined) s.notifyRecover = !!d.notifyRecover;
   save();
   schedule();
+  return state();
+});
+
+app.api('/api/rates', (d) => {
+  const id = String(d.id || '').trim();
+  if (!id) return state();
+  if (d.reset) {
+    delete db.rateOverrides[id];
+  } else {
+    const mult = Number(d.mult);
+    if (!Number.isFinite(mult) || mult <= 0 || mult > 100) return { ...state(), error: '倍率需在 0.1 ~ 100 之间' };
+    db.rateOverrides[id] = { name: d.name || id, mult: +mult.toFixed(2) };
+  }
+  rateRev++;
+  save();
   return state();
 });
 

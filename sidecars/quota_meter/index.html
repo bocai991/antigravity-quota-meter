@@ -80,6 +80,11 @@
   details.conv-fold[open] > summary::before { content:'▾'; }
   details.conv-fold .tag { margin:0; }
   .conv-body { margin-top:6px; padding-left:16px; color:var(--mut); }
+  .conv-body .kv { align-items:flex-start; }
+  .conv-body .kv > span:first-child { white-space:nowrap; flex-shrink:0; }
+  .conv-body .kv > span:last-child { text-align:right; }
+  details.meter-sec > summary .mhead { white-space:nowrap; }
+  details.meter-sec > summary .sub { text-align:right; }
   .ev { font-size:var(--fs-sm); padding:6px 0; border-top:1px solid var(--line); }
   .ev:first-child { border-top:none; }
   .set { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:6px 0; font-size:var(--fs); }
@@ -89,6 +94,19 @@
   .err { color:var(--crit); white-space:pre-wrap; }
   details.sec > summary { cursor:pointer; font-weight:600; font-size:var(--fs); color:var(--mut); user-select:none; }
   details.sec[open] > summary { color:var(--fg); }
+  /* 模型单价倍率 */
+  .mx { display:inline-block; margin-left:5px; padding:0 5px; border-radius:4px; font-size:12px; font-weight:650; font-variant-numeric:tabular-nums; line-height:1.45; }
+  .mx.low { color:var(--ok); background:color-mix(in srgb, var(--ok) 14%, transparent); }
+  .mx.mid { color:var(--warn); background:color-mix(in srgb, var(--warn) 14%, transparent); }
+  .mx.high { color:var(--crit); background:color-mix(in srgb, var(--crit) 14%, transparent); }
+  .rtbl { width:100%; border-collapse:collapse; font-size:var(--fs-sm); font-variant-numeric:tabular-nums; }
+  .rtbl td { padding:6px 0; border-top:1px solid var(--line); vertical-align:middle; }
+  .rtbl td:last-child { text-align:right; white-space:nowrap; }
+  .rtbl .pg td { border-top:none; padding:10px 0 2px; font-weight:600; color:var(--mut); font-size:13px; text-align:left; }
+  .rtbl input { width:64px; padding:2px 6px; text-align:right; font-size:13px; appearance:textfield; -moz-appearance:textfield; }
+  .rtbl input::-webkit-outer-spin-button, .rtbl input::-webkit-inner-spin-button { -webkit-appearance:none; margin:0; }
+  .pnote { font-size:12px; color:var(--warn); margin-left:5px; }
+  .pact { display:flex; gap:6px; justify-content:flex-end; margin-top:8px; }
   body.compact .wrap { padding:10px; }
   body.compact .card { padding:10px 12px; margin-bottom:10px; }
   body.compact .full-only { display:none; }
@@ -100,6 +118,7 @@
   <div id="advice"></div>
   <div id="pools"><div class="sub">加载中…</div></div>
   <div id="meter"></div>
+  <div id="rates" class="full-only"></div>
   <div id="extra" class="full-only"></div>
   <div class="foot" id="foot"></div>
 </div>
@@ -130,7 +149,12 @@ const winTitle = b => b.winKnown ? b.winLabel + '剩余限额' : esc(b.label);
 
 let S = null;
 let meterOpen = { card: true, moreConv: false };
+let poolModelsOpen = {};
 let convOpen = {};
+const fmtX = m => m == null ? '' : (+Number(m).toFixed(2)) + 'x';
+const mxCls = m => m <= 2 ? 'low' : m <= 6 ? 'mid' : 'high';
+const mxBadge = m => m == null ? '' : `<span class="mx ${mxCls(m)}" title="相对消耗倍率（越小越便宜耐用）">${fmtX(m)}</span>`;
+const modelItemsOf = g => g.modelItems?.length ? g.modelItems : models(g).map(name => ({ name, mult: null }));
 const fmtTok = n => !n ? '0' : n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(n);
 
 // ---------- 功能 4：切换建议 ----------
@@ -148,8 +172,15 @@ function renderAdvice() {
     let t = `<b>${esc(gz(p.g.name))}</b> ${p.lim.winKnown ? p.lim.winLabel : ''}额度${p.eff < 0.02 ? '已用完' : '仅剩 ' + pct(p.eff)}`;
     if (soon && p.eff >= 0.02) t += `，按当前速度约 ${dur(p.eta)}后耗尽`;
     t += `，${dur(resetMs(p.lim))}后重置。`;
-    t += alt ? `建议先切换到 <b>${esc(gz(alt.g.name))}</b>（剩 ${pct(alt.eff)}，如 ${esc(models(alt.g)[0])}）。`
-             : '其他池子也不充裕，建议缩小任务或等待重置。';
+    if (alt) {
+      const pick = modelItemsOf(alt.g)[0];
+      t += `建议先切换到 <b>${esc(gz(alt.g.name))}</b>（剩 ${pct(alt.eff)}${pick ? `，如 ${esc(pick.name)} ${fmtX(pick.mult)}` : ''}）。`;
+    } else if (p.eff < 0.02) {
+      t += '其他池子也不充裕，建议等待重置。';
+    } else {
+      const cheap = modelItemsOf(p.g)[0];
+      t += `其他池子也不充裕，建议先改用低倍率模型（如 ${cheap ? `${esc(cheap.name)} ${fmtX(cheap.mult)}` : '1x 模型'}）省着用。`;
+    }
     msgs.push({ level: p.eff < 0.05 ? 'crit' : 'warn', t });
   }
   const level = msgs.some(m => m.level === 'crit') ? 'crit' : msgs.length ? 'warn' : 'ok';
@@ -171,6 +202,7 @@ function spark(series, f) {
 
 function bucketSub(b) {
   const reset = b.reset ? `${dur(resetMs(b))}后重置` : '';
+  if (b.frac <= 0.001) return reset ? `已用完 · ${reset}` : '已用完';
   if (b.ratePerHour == null) return b.frac >= 1 ? '未使用' : `正在采集消耗速度… · ${reset}`;
   if (b.ratePerHour <= 0.001) return `近 45 分钟未消耗 · ${reset}`;
   const eta = etaMs(b);
@@ -179,12 +211,14 @@ function bucketSub(b) {
 }
 
 function renderPools() {
-  document.getElementById('pools').innerHTML = S.groups.map(g => {
+  const el = document.getElementById('pools');
+  el.innerHTML = S.groups.map(g => {
     const bs = [...g.buckets].sort((a, b) => winOrder(a) - winOrder(b));
     const min = Math.min(...bs.map(b => b.frac));
+    const open = poolModelsOpen[g.name] ?? true;
     return `<div class="card">
       <div class="gname"><span>${esc(gz(g.name))}</span><span class="chip" style="color:${color(min)};background:color-mix(in srgb, ${color(min)} 14%, transparent)">${pct(min)}</span></div>
-      <details class="models full-only"><summary>包含模型</summary>${models(g).map(m => `<span class="tag">${esc(m)}</span>`).join('')}</details>
+      <details class="models full-only" data-g="${esc(g.name)}" ${open ? 'open' : ''}><summary>模型与单价（按低到高）</summary>${modelItemsOf(g).map(m => `<span class="tag">${esc(m.name)}${mxBadge(m.mult)}</span>`).join('')}</details>
       ${bs.map(b => `<div class="row">
         <div class="top"><span>${winTitle(b)}</span><span class="pct">剩余 ${pct(b.frac)}</span></div>
         <div class="bar"><i style="width:${b.frac * 100}%;background:${color(b.frac)}"></i></div>
@@ -193,6 +227,7 @@ function renderPools() {
       </div>`).join('')}
     </div>`;
   }).join('') || '<div class="sub">没有额度数据</div>';
+  el.querySelectorAll('details.models').forEach(d => d.ontoggle = e => { poolModelsOpen[d.dataset.g] = e.target.open; });
 }
 
 // ---------- 功能 3：按「对话列表」自动统计并行任务油耗 ----------
@@ -216,8 +251,10 @@ function renderConvCard(c) {
     : c.active
     ? `<span class="badge act">⚡ ${dur(S.now - c.updatedAt)}前活跃</span>`
     : `<span class="badge idle">${c.updatedAt ? new Date(c.updatedAt).toLocaleString('zh-CN', { month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit' }) : '已休眠'}</span>`;
-  const models = c.models?.length ? c.models : ['暂无模型调用'];
-  const mtags = models.map(m => `<span class="tag">${esc(m)}</span>`).join('');
+  const models = c.models?.length ? c.models : [];
+  const mtags = models.length
+    ? models.map(m => `<span class="tag">${esc(m)}${mxBadge(c.modelMults?.[m])}</span>`).join('')
+    : '<span class="tag">暂无模型调用</span>';
   const tk = c.tokens || {};
   const tokLine = tk.total
     ? `<div class="kv"><span>Token 消耗</span><span>共 ${fmtTok(tk.total)}（输入 ${fmtTok(tk.input)} · 缓存 ${fmtTok(tk.cache)} · 输出 ${fmtTok(tk.output)}）</span></div>`
@@ -248,7 +285,7 @@ function renderMeter() {
   let h = `<div class="card">
     <details class="meter-sec" id="dmeter" ${meterOpen.card ? 'open' : ''}>
       <summary>
-        <span class="mhead">任务油耗统计（按对话列表自动命名）</span>
+        <span class="mhead" title="按对话列表自动命名">任务油耗统计</span>
         <span class="sub" style="font-weight:400">${activeConvs.length ? `${activeConvs.length} 个对话并行/活跃` : `共 ${convs.length} 个对话`}</span>
       </summary>
       <div class="meter-body">`;
@@ -273,6 +310,38 @@ function renderMeter() {
   $('dmeter') && ($('dmeter').ontoggle = e => meterOpen.card = e.target.open);
   el.querySelectorAll('details.conv-fold').forEach(d => d.ontoggle = e => { convOpen[d.dataset.cid] = e.target.open; });
   $('dmoreconv') && ($('dmoreconv').ontoggle = e => meterOpen.moreConv = e.target.open);
+}
+
+// ---------- 功能 5：模型单价倍率（如 1x / 5x / 10x） ----------
+let rateOpen = false, rateEdit = false;
+function renderRates() {
+  const R = S.rates;
+  const el = document.getElementById('rates');
+  if (!R?.pools?.length) { el.innerHTML = ''; return; }
+  const rows = R.pools.map(pool => `<tr class="pg"><td colspan="2">${esc(pool.label)}</td></tr>` + pool.models.map(r => `<tr>
+      <td>${esc(r.name)}${r.custom ? '<span class="pnote">自定义</span>' : ''}${rateEdit && r.custom ? ` <button class="preset" data-id="${esc(r.id)}" title="恢复默认倍率">↺</button>` : ''}</td>
+      <td>${rateEdit ? `<input type="number" min="0.1" max="100" step="0.5" data-id="${esc(r.id)}" data-name="${esc(r.name)}" value="${r.mult}"/> x` : mxBadge(r.mult)}</td></tr>`).join('')).join('');
+  el.innerHTML = `<div class="card"><details class="sec" id="drate" ${rateOpen ? 'open' : ''}>
+    <summary>模型单价倍率（${esc(R.baseline || '1x 基准')}）</summary>
+    <div style="margin-top:6px">
+      <table class="rtbl"><tbody>${rows}</tbody></table>
+      <div class="pact">${rateEdit ? '<button id="rcancel">取消</button><button id="rsave" class="primary">保存倍率</button>' : '<button id="redit">自定义倍率</button>'}</div>
+      ${R.note ? `<div class="sub" style="margin-top:6px">${esc(R.note)}</div>` : ''}
+    </div></details></div>`;
+  const $ = id => document.getElementById(id);
+  $('drate').ontoggle = e => rateOpen = e.target.open;
+  if ($('redit')) $('redit').onclick = () => { rateEdit = true; renderRates(); };
+  if ($('rcancel')) $('rcancel').onclick = () => { rateEdit = false; renderRates(); };
+  el.querySelectorAll('.preset').forEach(b => b.onclick = async () => { S = await api('api/rates', { id: b.dataset.id, reset: true }); render(); renderRates(); });
+  if ($('rsave')) $('rsave').onclick = async () => {
+    const before = Object.fromEntries(R.pools.flatMap(p => p.models).map(r => [r.id, r.mult]));
+    for (const i of el.querySelectorAll('input[data-id]')) {
+      const v = Number(i.value);
+      if (!Number.isFinite(v) || v <= 0 || v === before[i.dataset.id]) continue;
+      S = await api('api/rates', { id: i.dataset.id, name: i.dataset.name, mult: v });
+    }
+    rateEdit = false; render();
+  };
 }
 
 // ---------- 功能 2：提醒记录 + 设置 ----------
@@ -310,6 +379,7 @@ function render() {
     return;
   }
   renderAdvice(); renderPools(); renderMeter();
+  if (!compact && !rateEdit) renderRates();
   if (!compact) renderExtra();
   document.getElementById('foot').textContent = (S.error ? '⚠ 最近一次刷新失败 · ' : '') +
     '更新于 ' + new Date(S.fetchedAt).toLocaleTimeString('zh-CN') + ` · 后台每 ${S.settings.pollMin} 分钟刷新 · 不消耗 token`;
