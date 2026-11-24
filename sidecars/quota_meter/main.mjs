@@ -22,8 +22,26 @@ const DEFAULTS = { threshold: 20, notify: true, notifyRecover: true, pollMin: 2 
 const RECOVER_AT = 0.9;
 const RATE_WINDOW = 45 * MIN;
 
-const GROUP_ZH = { 'Gemini Models': 'Gemini 模型', 'Claude and GPT models': 'Claude 与 GPT 模型', 'Gemini 4 Argon': 'Gemini 4 Argon' };
-const WIN_ZH = { '5h': '5 小时限额', weekly: '每周限额' };
+// ---------- 额度池 / 窗口自动识别 ----------
+// 不写死任何池名、池数量或窗口：全部以语言服务器实时返回的 groups / buckets 为准。
+// 池名做通用中文化（"X and Y models" → "X 与 Y 模型"），未知名称原样显示。
+const zhGroup = (n) => String(n || '').replace(/\s+and\s+/gi, ' 与 ').replace(/\bmodels?\b/gi, '模型').replace(/\s+/g, ' ').trim();
+const WIN_NAMED = { hourly: [HOUR, '每小时'], daily: [DAY, '每天'], weekly: [7 * DAY, '每周'], monthly: [30 * DAY, '每月'] };
+const WIN_UNIT = { m: [MIN, '分钟'], min: [MIN, '分钟'], h: [HOUR, '小时'], hr: [HOUR, '小时'], d: [DAY, '天'], w: [7 * DAY, '周'] };
+function winInfo(w, fallbackLabel) {
+  const k = String(w || '').toLowerCase().trim();
+  if (WIN_NAMED[k]) return { ms: WIN_NAMED[k][0], label: WIN_NAMED[k][1], known: true };
+  const m = /^(\d+(?:\.\d+)?)\s*(m|min|h|hr|d|w)$/.exec(k);
+  if (m) return { ms: Number(m[1]) * WIN_UNIT[m[2]][0], label: `${m[1]} ${WIN_UNIT[m[2]][1]}`, known: true };
+  return { ms: 7 * DAY, label: fallbackLabel || w || '限额', known: false };
+}
+const winName = (w, fallback) => { const i = winInfo(w, fallback); return i.known ? `${i.label}限额` : i.label; };
+const modelListOf = (g) => {
+  const m = /Models within this group:\s*(.+)$/i.exec(g?.description || '');
+  return m ? m[1].split(',').map((s) => s.trim()).filter(Boolean) : [];
+};
+// 用于检测"额度池结构变化"：只看池名与其包含的模型，不看 bucket（避免服务端偶发少返回某个窗口时误报）
+const poolSigOf = (groups) => groups.map((g) => `${g.displayName}:${modelListOf(g).join('+')}`).sort().join('|');
 
 function findBrainDir() {
   for (let d = DATA_DIR; d && d !== dirname(d); d = dirname(d)) {
@@ -49,6 +67,10 @@ function load() {
   }
 }
 let db = load();
+for (const m of Object.values(db.meta || {})) {
+  m.groupLabel ||= zhGroup(m.group);
+  if (!m.winLabel) { const wi = winInfo(m.window); Object.assign(m, { winLabel: wi.label, winKnown: wi.known, winMs: wi.ms }); }
+}
 delete db.mark;
 delete db.marks;
 delete db.runs;
@@ -116,9 +138,11 @@ async function poll(force = false) {
       for (const g of live.groups) {
         for (const b of g.buckets || []) {
           v[b.bucketId] = frac(b);
-          db.meta[b.bucketId] = { group: g.displayName, window: b.window, reset: b.resetTime };
+          const wi = winInfo(b.window, b.displayName);
+          db.meta[b.bucketId] = { group: g.displayName, groupLabel: zhGroup(g.displayName), window: b.window, winLabel: wi.label, winKnown: wi.known, winMs: wi.ms, reset: b.resetTime };
         }
       }
+      detectPoolChange();
       record(v, force);
       checkAlerts();
       return true;
@@ -168,7 +192,7 @@ function rateFor(id) {
 }
 
 function seriesFor(id, window) {
-  const span = window === '5h' ? 5 * HOUR : 7 * DAY;
+  const span = Math.min(winInfo(window).ms, 7 * DAY);
   const now = Date.now();
   let pts = db.samples.filter((s) => now - s.t <= span && s.v[id] !== undefined).map((s) => [s.t, +s.v[id].toFixed(4)]);
   if (pts.length > 60) {
@@ -193,7 +217,7 @@ function checkAlerts() {
     for (const b of g.buckets || []) {
       const f = frac(b);
       const a = (db.alerts[b.bucketId] ||= {});
-      const name = `${GROUP_ZH[g.displayName] || g.displayName} · ${WIN_ZH[b.window] || b.displayName}`;
+      const name = `${zhGroup(g.displayName)} · ${winName(b.window, b.displayName)}`;
       if (f < 0.05 && !a.crit) {
         a.crit = a.low = true;
         dirty = true;
@@ -221,6 +245,15 @@ function notify(title, body) {
 }
 
 function toast(title, body) {
+  if (process.platform === 'linux') {
+    execFile(
+      'notify-send',
+      ['-a', 'Antigravity 额度速览', String(title), String(body)],
+      { timeout: 10000 },
+      (err) => err && console.error('[quota] toast failed:', err.message),
+    );
+    return;
+  }
   if (process.platform !== 'win32') return;
   const x = (s) => String(s).replace(/[<>&"']/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' })[c]);
   const xml = `<toast><visual><binding template="ToastGeneric"><text>${x(title)}</text><text>${x(body)}</text></binding></visual></toast>`;
@@ -240,7 +273,51 @@ function toast(title, body) {
 }
 
 // ---------- 功能 3：按「对话列表」自动统计并行任务油耗 ----------
-const poolOfModel = (m) => (/argon/i.test(m) ? 'Gemini 4 Argon' : /claude|gpt|sonnet|opus/i.test(m) ? 'Claude and GPT models' : 'Gemini Models');
+// 模型 → 额度池：完全依据服务端实时返回的分组自动识别，不写死任何池名。
+//   1. 精确匹配：模型 id 以分组内某个模型名（或分组名本身，如 "Gemini 4 Argon"）开头，取最长（最具体）的匹配；
+//   2. 厂商兜底：按模型 id 的厂商前缀（gemini / claude / gpt ...）找包含同厂商模型最多的分组；
+//   3. 仍无法识别时归入第一个分组。
+const norm = (s) => String(s || '').toLowerCase().replace(/\(.*?\)/g, '').replace(/[^a-z0-9]/g, '');
+let poolMemo = { sig: '', map: new Map() };
+function poolOfModel(m) {
+  const sig = poolSigOf(live.groups);
+  if (poolMemo.sig !== sig) poolMemo = { sig, map: new Map() };
+  if (poolMemo.map.has(m)) return poolMemo.map.get(m);
+  const id = norm(m);
+  const cands = live.groups.map((g) => ({ name: g.displayName, keys: [...modelListOf(g), g.displayName].map(norm).filter(Boolean) }));
+  let best = null, bestLen = 0;
+  for (const c of cands) for (const k of c.keys) if (id.startsWith(k) && k.length > bestLen) { best = c.name; bestLen = k.length; }
+  if (!best) {
+    const vendor = (/^[a-z]+/.exec(String(m || '').toLowerCase()) || [''])[0];
+    let bestN = 0;
+    for (const c of cands) {
+      const n = c.keys.filter((k) => vendor && k.startsWith(vendor)).length;
+      if (n > bestN) { best = c.name; bestN = n; }
+    }
+  }
+  best ||= cands[0]?.name || '未知额度池';
+  poolMemo.map.set(m, best);
+  return best;
+}
+
+// 额度池结构变化检测：池子新增 / 消失 / 合并时记录提醒（例如 Argon 并入 Gemini 池）
+function detectPoolChange() {
+  if (!live.groups.length) return;
+  const sig = poolSigOf(live.groups);
+  const names = live.groups.map((g) => g.displayName);
+  const prev = db.pools;
+  db.pools = { sig, names };
+  if (!prev || !prev.sig) return save();
+  if (prev.sig === sig) return;
+  const added = names.filter((n) => !prev.names.includes(n)).map(zhGroup);
+  const removed = prev.names.filter((n) => !names.includes(n)).map(zhGroup);
+  const parts = [];
+  if (added.length) parts.push(`新增：${added.join('、')}`);
+  if (removed.length) parts.push(`移除：${removed.join('、')}`);
+  if (!parts.length) parts.push('池内包含的模型发生了调整');
+  notify('额度池结构已变化', `现在共 ${names.length} 个额度池。${parts.join('；')}`);
+}
+
 const factorOfModel = (m) => (/flash|hydrogen/i.test(m) ? 0.25 : /opus|carbon/i.test(m) ? 2.5 : 1.0);
 const shortModel = (m) =>
   String(m || '')
@@ -302,7 +379,7 @@ function readTranscriptSteps(brainDir, id) {
         entry.tokens.output += out;
         entry.tokens.total += inp + cache + out;
         const w = Math.max(200, (inp + cache * 0.1 + out * 4) * factorOfModel(obj.model));
-        entry.steps.push({ t, pool: poolOfModel(obj.model), w });
+        entry.steps.push({ t, model: obj.model, w });
         entry.modelSet.add(shortModel(obj.model));
       }
       entry.models = [...entry.modelSet];
@@ -464,10 +541,10 @@ function buildConversationStats() {
   for (const d of allDrops) {
     const weights = new Map();
     let sum = 0;
-    const winStart = d.pre ? d.t1 - (d.window === '5h' ? 5 * HOUR : 7 * DAY) : d.t0 - 120e3;
+    const winStart = d.pre ? d.t1 - Math.min(winInfo(d.window).ms, 7 * DAY) : d.t0 - 120e3;
     const winEnd = d.t1 + 45e3;
     for (const [id, c] of convMap.entries()) {
-      const w = c.steps.filter((st) => st.pool === d.pool && st.t >= winStart && st.t <= winEnd).reduce((a, x) => a + x.w, 0);
+      const w = c.steps.filter((st) => poolOfModel(st.model) === d.pool && st.t >= winStart && st.t <= winEnd).reduce((a, x) => a + x.w, 0);
       if (w > 0) {
         weights.set(id, w);
         sum += w;
@@ -475,7 +552,7 @@ function buildConversationStats() {
     }
     if (!sum && !d.pre) {
       for (const [id, c] of convMap.entries()) {
-        const w = c.steps.filter((st) => st.pool === d.pool && st.t >= d.t0 - 20 * MIN && st.t <= d.t1 + 60e3).reduce((a, x) => a + x.w, 0);
+        const w = c.steps.filter((st) => poolOfModel(st.model) === d.pool && st.t >= d.t0 - 20 * MIN && st.t <= d.t1 + 60e3).reduce((a, x) => a + x.w, 0);
         if (w > 0) {
           weights.set(id, w);
           sum += w;
@@ -515,11 +592,16 @@ function buildConversationStats() {
 function state() {
   const groups = live.groups.map((g) => ({
     name: g.displayName,
+    label: zhGroup(g.displayName),
+    models: modelListOf(g).length ? modelListOf(g) : [g.displayName],
     description: g.description || '',
     buckets: (g.buckets || []).map((b) => ({
       id: b.bucketId,
       window: b.window,
       label: b.displayName,
+      winLabel: winInfo(b.window, b.displayName).label,
+      winKnown: winInfo(b.window, b.displayName).known,
+      winMs: winInfo(b.window, b.displayName).ms,
       frac: frac(b),
       reset: b.resetTime,
       ratePerHour: rateFor(b.bucketId),
